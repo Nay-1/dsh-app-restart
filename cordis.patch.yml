@@ -1,0 +1,8 @@
+# dsh-app-restart bundle 层：插入「重启桌面应用」插件行。
+# host 半提供重启 API：拉分离式助手 → 关掉 Electron 外壳 → 宿主顺着 IPC 断开优雅停机
+# → 助手重新拉起 DeepSeek Harness.exe。client 半往 sidebar.footer.action 注册侧栏
+# 底部的「重启」按钮（设置按钮旁边）。
+- insert:
+    - id: dsh-app-restart
+      name: 'dsh-app-restart'
+      config: {}
