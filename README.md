@@ -1,18 +1,21 @@
 # dsh-app-restart
 
-给 DSH 桌面端侧栏底部加一个「**重启**」按钮：点一下，整个桌面应用（Electron 外壳 +
-Host 进程）重启一遍，几秒后自己回来 —— 也就是官方 README 里那句「改完必须重启 DSH」
-所做的事，只是不用手动退出再打开。
+把整个 DSH 桌面应用（Electron 外壳 + Host 进程）重启一遍，几秒后自己回来 ——
+也就是官方 README 里那句「改完必须重启 DSH」所做的事，只是不用手动退出再打开。
+
+两个入口，共用同一条重启链路：
 
 ```
 侧栏底部：  [ ⟳ 重启 ]  [ ⚙ 设置 ]
+输入框：    /restart
 ```
 
 | | |
 |---|---|
-| 位置 | `sidebar.footer.action`（官方说明：*Optional actions beside Settings at the sidebar foot*） |
-| 形态 | 侧栏展开是一整行「图标 + 重启」；收成竖栏时是圆形图标按钮 + 浮层提示 |
-| 动作 | 二次确认 → 关掉外壳 → 重新拉起 `DeepSeek Harness.exe` |
+| 按钮位置 | `sidebar.footer.action`（官方说明：*Optional actions beside Settings at the sidebar foot*） |
+| 按钮形态 | 侧栏展开是一整行「图标 + 重启」；收成竖栏时是圆形图标按钮 + 浮层提示 |
+| 斜杠命令 | `/restart` —— 界面零足迹，在输入框打 `/` 出现在命令菜单里（和 `/compact`、`/plan` 并列） |
+| 动作 | 按钮走二次确认；命令是明确打出来的，直接执行 → 关掉外壳 → 重新拉起 `DeepSeek Harness.exe` |
 | 适用 | **只**适用于 DSH 桌面端；`dsh web` 那种终端里跑的 Host 会被明确拒绝 |
 
 ## 装
@@ -110,6 +113,24 @@ dsh plugin --profile desktop add "file:C:/Users/prince/Desktop/dsh-plugin/dsh-ap
 - primitives 缺件全部有兜底：没有 `IconRefreshOutlineRegular` 就自绘一个 16px SVG 刷新
   图标，没有 `Modal` / `Button` 就自绘（遮罩点击、Escape 都留着）。
 
+## 斜杠命令 `/restart`
+
+界面零足迹的那条路：输入框打 `/` 就会在命令菜单里看到它（和 `/compact`、`/plan`、
+`/export` 并列），回车即重启。
+
+```
+/restart   重启 DSH 桌面应用（关掉外壳并重新拉起）
+```
+
+- 契约来自宿主服务 `ctx.commands.register({ name, description, handler })`，处理器返回
+  `{ kind: "success", text }` 或 `{ kind: "error", text }`，**不经过模型**，所以有副作用
+  是安全的。结果文本以命令行的形式落在会话里，带上这次重启的日志路径。
+- 命令**没有二次确认**：它是你明确打出来的，再来一次点击确认没有意义。要确认就走按钮。
+- 命令的 `description` 是纯字符串、没有 locale 绑定，所以固定写中文。
+- 服务用 `ctx.get("commands")` **动态取**，没有写进 `inject`：写进去的话，万一某个组合
+  里没有这个服务，整个插件都装不上（连按钮和 HTTP 接口一起没）；动态取不到只少一条命令，
+  并在日志里留一句告警。
+
 ## HTTP 接口
 
 前缀 `/app-restart/api`。写接口要求自定义头 `x-dsh-plugin-call: app-restart`，并且
@@ -149,7 +170,7 @@ Invoke-RestMethod -Headers @{ 'x-dsh-plugin-call' = 'app-restart' } `
 ## 自测
 
 ```powershell
-node test-host.mjs      # 50 项
+node test-host.mjs      # 62 项
 node test-client.mjs    # 54 项
 ```
 

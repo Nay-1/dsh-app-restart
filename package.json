@@ -1,8 +1,8 @@
 {
   "name": "dsh-app-restart",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "private": true,
-  "description": "在 DSH 桌面端侧栏底部加一个「重启」按钮：把整个桌面应用（Electron 外壳 + Host 进程）重启一遍，让新装的插件与改动真正生效。",
+  "description": "把整个 DSH 桌面应用重启一遍：侧栏底部一个「重启」按钮 + 斜杠命令 /restart，让新装的插件与改动的配置真正生效。",
   "license": "MIT",
   "type": "module",
   "main": "./lib/index.js",
