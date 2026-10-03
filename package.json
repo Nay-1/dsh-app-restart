@@ -1,6 +1,6 @@
 {
   "name": "dsh-app-restart",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "private": true,
   "description": "把整个 DSH 桌面应用重启一遍：侧栏底部一个「重启」按钮 + 斜杠命令 /restart，让新装的插件与改动的配置真正生效。",
   "license": "MIT",

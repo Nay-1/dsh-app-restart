@@ -74,40 +74,23 @@ mod.apply(ctx);
 check("注册了一条路由", routes.length === 1);
 check("是前缀路由 /app-restart/api", routes[0]?.kind === "prefix" && routes[0]?.path === "/app-restart/api");
 check("handler 是函数", typeof routes[0]?.handler === "function");
-check("路由与命令都在 ctx.effect 里注册（可卸载）",
-  effects.length === 2 && effects.every((entry) => typeof entry.disposer === "function"));
+check("在 ctx.effect 里注册（可卸载）", effects.length === 1 && typeof effects[0].disposer === "function");
 check("助手文件随包发布", existsSync(helperPath));
 
 /* ------------------------------------------------------------------------ *
- * 1b. 斜杠命令 /restart
+ * 1b. 斜杠命令**不该**在这一半注册
  * ------------------------------------------------------------------------ */
-console.log("\n[1b] 斜杠命令");
+console.log("\n[1b] 斜杠命令归属");
 
-check("注册了一条命令", commands.length === 1);
-check("命令名是 restart", commands[0]?.name === "restart");
-check("命令有给用户看的说明", typeof commands[0]?.description === "string" && commands[0].description.length > 0);
-check("命令不带 definitionId（可选字段，不硬造）", commands[0]?.definitionId === undefined);
-check("handler 是函数", typeof commands[0]?.handler === "function");
+// `/` 菜单的行长相由 dsh-client-ui-commands 的 builtinRowFace() 决定：宿主命令只能从
+// 内置表 HOST_FACES 取 label/description/icon，第三方宿主命令拿不到（只会退回
+// 「命令名 + description」的素颜）；客户端贡献则可以自己给这三个字段。
+// 更要命的是两条路不能同名：candidates() 先跑宿主目录，再遇到同名贡献会直接 throw
+// （"contribution /restart collides with a host command"）。
+// 所以命令统一由 client 半的贡献提供，这里钉死「宿主半不许再注册它」。
+check("宿主半没有注册 /restart（同名会和客户端贡献撞车）", commands.length === 0,
+  commands.map((entry) => entry.name).join(", "));
 check("没有多余的告警", warnings.length === 0);
-
-// 在测试进程里它不是桌面宿主，所以命令应当结结实实地报错、而不是假装成功。
-const commandResult = await commands[0].handler({ rawInput: "" });
-check("非桌面宿主时命令返回 error（不是 success）", commandResult?.kind === "error", JSON.stringify(commandResult));
-check("错误文案说明了原因", String(commandResult?.text ?? "").includes("桌面端"));
-check("失败的命令没有偷偷触发重启", commands.length === 1 && effects.every((entry) => entry.label !== "restart"));
-
-// commands 服务缺席：插件必须照样装得上（HTTP 接口和按钮不能跟着一起没）。
-const bareRoutes = [];
-const bareWarnings = [];
-const bareEffects = [];
-mod.apply({
-  logger: { info: () => {}, warn: (message) => bareWarnings.push(String(message)) },
-  effect: (install, label) => { bareEffects.push(label); return install(); },
-  webServer: { register: (route) => { bareRoutes.push(route); return () => {}; } }
-});
-check("没有 commands 服务时仍然挂上 HTTP 路由", bareRoutes.length === 1);
-check("没有 commands 服务时只注册了路由这一条 effect", bareEffects.length === 1);
-check("并且明确告警说跳过了命令", bareWarnings.some((line) => line.includes("commands")));
 
 /* ------------------------------------------------------------------------ *
  * 2. API 行为

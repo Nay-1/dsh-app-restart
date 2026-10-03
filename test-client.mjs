@@ -180,6 +180,17 @@ check("导出 inject（slots / locale）",
   Array.isArray(mod.inject) && ["slots", "locale"].every((key) => mod.inject.includes(key)));
 
 /* ---- 应用 ---------------------------------------------------------------- */
+const injections = [];
+const commandContributions = [];
+const commandEffects = [];
+/** 让「commandUi 缺席」那条降级路径可测：置为 undefined 时 scope.get 就取不到。 */
+let commandUiService = {
+  register: (contribution) => {
+    commandContributions.push(contribution);
+    return () => {};
+  }
+};
+
 const ctx = {
   effect: (fn) => { const disposer = fn(); return disposer; },
   locale: {
@@ -189,6 +200,14 @@ const ctx = {
       if (params === undefined) return template;
       return Object.keys(params).reduce((text, name) => text.split(`{${name}}`).join(String(params[name])), template);
     }
+  },
+  // cordis 的 scoped inject：依赖齐了就带着子 scope 跑回调（ui-conversation 的 /file 就是这么注册的）。
+  inject: (deps, callback) => {
+    injections.push(deps);
+    callback({
+      get: (name) => (name === "commandUi" ? commandUiService : undefined),
+      effect: (fn, label) => { const disposer = fn(); commandEffects.push(label); return disposer; }
+    });
   },
   slots: {
     inject: (name, install) => { injectedSlots.push(name); install(); },
@@ -201,10 +220,27 @@ mod.apply(ctx);
 check("注册了 zh/en 字典", localeRegistrations.length === 1
   && localeRegistrations[0].ns === "app-restart"
   && localeRegistrations[0].dicts.zh["action.restart"] === "重启"
-  && typeof localeRegistrations[0].dicts.en["action.restart"] === "string");
+  && typeof localeRegistrations[0].dicts.en["action.restart"] === "string"
+  && localeRegistrations[0].dicts.zh["menu.label"] === "重启");
 check("注入了样式标签", styleTags.length === 1 && String(styleTags[0].textContent).includes(".dsr-row"));
 check("向 sidebar.footer.action 注入了插槽", injectedSlots.includes("sidebar.footer.action"));
 check("只注册了一个入口", registered.length === 1);
+
+/* ---- 0b. 斜杠命令：客户端贡献 -------------------------------------------- */
+// 宿主命令拿不到 `/` 菜单的图标与中文名（builtinRowFace 只认内置表），
+// 而且宿主目录与同名贡献会撞车 —— 所以命令必须由这里注册。
+check("要了 commandUi 服务（scoped inject）", injections.length === 1 && injections[0][0] === "commandUi");
+check("注册了一条命令贡献", commandContributions.length === 1);
+check("在 scope.effect 里注册（可卸载）", commandEffects.length === 1 && commandEffects[0] === "app-restart: /restart command");
+
+const command = commandContributions[0];
+check("命令名是 restart", command?.name === "restart");
+check("中文名是「重启」（菜单左侧那一栏）", command?.label?.() === "重启");
+check("带一句说明（菜单右侧）", String(command?.description?.() ?? "").includes("重新拉起"));
+check("图标给的是刷新图标组件本身", command?.icon === IconRefreshOutlineRegular);
+check("available 是同步可判定的", command?.available?.({}) === true);
+check("ui 是 action 型（附着附件也不拦）", command?.ui?.kind === "action" && typeof command?.ui?.run === "function");
+check("label 是 thunk（切换语言时会重读）", typeof command?.label === "function");
 
 const entry = registered[0];
 check("slot 名正确", entry.spec.name === "sidebar.footer.action");
@@ -395,6 +431,42 @@ const noT = mount(bareRegistered[0].Component, { wide: true, api: face.api });
 const noTTree = noT.render();
 await noT.settle(4);
 check("没有注入 t 也显示中文", byText(buttonOf(noTTree), "重启"));
+
+/* ---- 8. 斜杠命令真的能触发重启 ------------------------------------------- */
+console.log("\n[8] /restart 的行为");
+
+const alerts = [];
+globalThis.window.alert = (message) => { alerts.push(String(message)); };
+
+responder = async () => ({ status: 200, json: async () => ({ ok: true, result: { probeAfterMs: 8000, logPath: "C:/tmp/restart.log" } }) });
+fetchCalls.length = 0;
+command.ui.run({});
+await new Promise((resolve) => setTimeout(resolve, 20));
+const commandCall = fetchCalls.find((call) => call.url === "/app-restart/api/restart");
+check("run() 打出 POST /app-restart/api/restart", commandCall !== undefined && commandCall.init.method === "POST");
+check("带上 JSON content-type", commandCall?.init.headers["content-type"] === "application/json");
+check("带上调用头", commandCall?.init.headers["x-dsh-plugin-call"] === "app-restart");
+check("成功时不打扰用户", alerts.length === 0);
+
+responder = async () => ({ status: 409, json: async () => ({ ok: false, code: "unsupported", error: "当前进程不是 DSH 桌面端的 Host" }) });
+command.ui.run({});
+await new Promise((resolve) => setTimeout(resolve, 20));
+check("失败时明确报错（不让用户以为重启了）", alerts.length === 1 && alerts[0].includes("不是 DSH 桌面端的 Host"));
+
+// commandUi 缺席：插件照样要装得上（按钮不能跟着一起没）。
+commandUiService = undefined;
+const noCommandUiSlots = [];
+mod.apply({
+  effect: (fn) => fn(),
+  locale: ctx.locale,
+  inject: (deps, callback) => callback({ get: () => undefined, effect: (fn) => fn() }),
+  slots: {
+    inject: (name, install) => { noCommandUiSlots.push(name); install(); },
+    register: () => {}
+  }
+});
+check("没有 commandUi 时按钮插槽照样注册", noCommandUiSlots.includes("sidebar.footer.action"));
+check("没有 commandUi 时不会抛错（apply 走完）", true);
 
 console.log(`\n${failed === 0 ? "全部通过" : "有失败项"}：${pass} 通过 / ${failed} 失败`);
 process.exitCode = failed === 0 ? 0 : 1;

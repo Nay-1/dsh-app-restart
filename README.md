@@ -14,7 +14,7 @@
 |---|---|
 | 按钮位置 | `sidebar.footer.action`（官方说明：*Optional actions beside Settings at the sidebar foot*） |
 | 按钮形态 | 侧栏展开是一整行「图标 + 重启」；收成竖栏时是圆形图标按钮 + 浮层提示 |
-| 斜杠命令 | `/restart` —— 界面零足迹，在输入框打 `/` 出现在命令菜单里（和 `/compact`、`/plan` 并列） |
+| 斜杠命令 | `/restart` —— 界面零足迹，在输入框打 `/` 出现在命令菜单里，长相与内置命令一致（图标 + 中文名 + 说明） |
 | 动作 | 按钮走二次确认；命令是明确打出来的，直接执行 → 关掉外壳 → 重新拉起 `DeepSeek Harness.exe` |
 | 适用 | **只**适用于 DSH 桌面端；`dsh web` 那种终端里跑的 Host 会被明确拒绝 |
 
@@ -115,21 +115,41 @@ dsh plugin --profile desktop add "file:C:/Users/prince/Desktop/dsh-plugin/dsh-ap
 
 ## 斜杠命令 `/restart`
 
-界面零足迹的那条路：输入框打 `/` 就会在命令菜单里看到它（和 `/compact`、`/plan`、
-`/export` 并列），回车即重启。
+界面零足迹的那条路：输入框打 `/` 就会在命令菜单里看到它，而且和内置命令长得一样 ——
+**刷新图标 + 中文名 + 英文命令名 + 右侧说明**（和「模型 model」「下载日志 export」同一排面）。
 
 ```
-/restart   重启 DSH 桌面应用（关掉外壳并重新拉起）
+⟳  重启   restart                        重启 DSH 桌面应用（关掉外壳并重新拉起）
 ```
 
-- 契约来自宿主服务 `ctx.commands.register({ name, description, handler })`，处理器返回
-  `{ kind: "success", text }` 或 `{ kind: "error", text }`，**不经过模型**，所以有副作用
-  是安全的。结果文本以命令行的形式落在会话里，带上这次重启的日志路径。
+- 它是 `commandUi.register({ name, label, description, icon, available, ui })` ——
+  **客户端贡献**，不是宿主命令。`label` / `description` 是函数（每次投影重读，跟着语言走），
+  `icon` 传组件本身，`ui.kind: "action"` 的 `run()` 在「菜单选中」和「打命令回车」两条路上
+  都会跑，里面打的是同一个 `POST /app-restart/api/restart`。
 - 命令**没有二次确认**：它是你明确打出来的，再来一次点击确认没有意义。要确认就走按钮。
-- 命令的 `description` 是纯字符串、没有 locale 绑定，所以固定写中文。
-- 服务用 `ctx.get("commands")` **动态取**，没有写进 `inject`：写进去的话，万一某个组合
-  里没有这个服务，整个插件都装不上（连按钮和 HTTP 接口一起没）；动态取不到只少一条命令，
-  并在日志里留一句告警。
+- 只能打英文名 `/restart`（宿主命令能靠本地化 claim token 支持 `/计划` 那种写法，
+  客户端贡献是按名字直接匹配的）。菜单里搜「重启」也能把它筛出来（`rankByName` 会看 label）。
+
+### 为什么不是宿主命令（踩过两次的坑）
+
+| 做法 | 结果 |
+|---|---|
+| 宿主 `ctx.commands.register({ name: "restart", ... })` | 能用，但菜单里是**素颜**：只有 `restart` + 一句 description，既没图标也没中文名 |
+| 宿主命令 **+** 同名客户端贡献 | **直接报错**：`candidates()` 先跑宿主目录，再遇到同名贡献就 throw（`contribution /restart collides with a host command`） |
+| 只留客户端贡献（现在的做法） | 菜单长相与内置命令一致 ✅ |
+
+原因在 `dsh-client-ui-commands` 的这段：
+
+```js
+for (const c of list) rows.push({ name: c.name, ...builtinRowFace(c, t) ?? { description: c.description } });
+```
+
+`builtinRowFace()` 只查内置表 `HOST_FACES`（写死的 compact / permission / plan / export /
+goal / feedback…），**第三方宿主命令永远查不到**，只能退回 `{ description }`；而客户端贡献
+那一支可以自己给 `label` / `description` / `icon`。
+
+所以宿主半**故意不注册** `restart` 命令，自测里有一条专门钉住这件事（`test-host.mjs` 的
+「宿主半没有注册 /restart」），免得以后有人好心搬回去、把菜单搞挂。
 
 ## HTTP 接口
 
@@ -170,8 +190,8 @@ Invoke-RestMethod -Headers @{ 'x-dsh-plugin-call' = 'app-restart' } `
 ## 自测
 
 ```powershell
-node test-host.mjs      # 62 项
-node test-client.mjs    # 54 项
+node test-host.mjs      # 52 项
+node test-client.mjs    # 71 项
 ```
 
 - `test-host.mjs`：注册契约、HTTP 行为（含跨站防线与各种拒绝），以及**把重启助手真的
