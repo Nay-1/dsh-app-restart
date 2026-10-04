@@ -1,21 +1,20 @@
 # dsh-app-restart
 
-把整个 DSH 桌面应用（Electron 外壳 + Host 进程）重启一遍，几秒后自己回来 ——
-也就是官方 README 里那句「改完必须重启 DSH」所做的事，只是不用手动退出再打开。
-
-两个入口，共用同一条重启链路：
+一条斜杠命令 `/restart`，把整个 DSH 桌面应用（Electron 外壳 + Host 进程）重启一遍，
+几秒后自己回来 —— 也就是官方 README 里那句「改完必须重启 DSH」所做的事，
+只是不用手动退出再打开。
 
 ```
-侧栏底部：  [ ⟳ 重启 ]  [ ⚙ 设置 ]
-输入框：    /restart
+输入框：  /restart
 ```
+
+界面零足迹：不占任何插槽、不加按钮、不插样式表 —— 想重启就在输入框打这条命令。
 
 | | |
 |---|---|
-| 按钮位置 | `sidebar.footer.action`（官方说明：*Optional actions beside Settings at the sidebar foot*） |
-| 按钮形态 | 侧栏展开是一整行「图标 + 重启」；收成竖栏时是圆形图标按钮 + 浮层提示 |
-| 斜杠命令 | `/restart` —— 界面零足迹，在输入框打 `/` 出现在命令菜单里，长相与内置命令一致（图标 + 中文名 + 说明） |
-| 动作 | 按钮走二次确认；命令是明确打出来的，直接执行 → 关掉外壳 → 重新拉起 `DeepSeek Harness.exe` |
+| 入口 | `/restart`，在输入框打 `/` 出现在命令菜单里，长相与内置命令一致（图标 + 中文名 + 说明） |
+| 动作 | 命令是明确打出来的，直接执行 → 关掉外壳 → 重新拉起 `DeepSeek Harness.exe` |
+| 失败 | 弹窗说清楚为什么没成（非桌面端、已经有一次在路上、host 半没加载…） |
 | 适用 | **只**适用于 DSH 桌面端；`dsh web` 那种终端里跑的 Host 会被明确拒绝 |
 
 ## 装
@@ -24,8 +23,9 @@
 dsh plugin --profile desktop add "file:C:/Users/prince/Desktop/dsh-plugin/dsh-app-restart"
 ```
 
-装完**必须重启一次 DSH** 才会加载（插件两半都只在启动时加载一次，没有热重载）：
-这一次得手动退出再打开 —— 因为「重启」按钮本身还没被加载进来。之后它就在侧栏底部了。
+装完**必须重启一次 DSH** 才会加载（插件两半都只在启动时加载一次，没有热重载）。
+第一次装只能手动退出再打开 —— 命令自己还没被加载进来；从第二次起，改完源码就能用
+`/restart` 自己完成这一次重启了。
 
 改完源码重新生效（pnpm 的 `file:` 依赖是拷贝不是软链，且只看 lockfile，直接再 `add`
 只会说 `Already up to date`）：
@@ -62,7 +62,7 @@ dsh plugin --profile desktop add "file:C:/Users/prince/Desktop/dsh-plugin/dsh-ap
 **3. 于是只剩一条路：自己把外壳关掉，再把应用拉起来。**
 
 ```
-点击 → POST /app-restart/api/restart → 回包（前端显示「正在重启…」）
+/restart（或直接 POST /app-restart/api/restart）→ 回包
      → host 半拉起分离式助手（同一个 exe + ELECTRON_RUN_AS_NODE=1，跑 lib/relaunch-helper.cjs）
      → 助手静默 settleMs 让回包落地
      → 终止外壳 PID
@@ -93,29 +93,16 @@ dsh plugin --profile desktop add "file:C:/Users/prince/Desktop/dsh-plugin/dsh-ap
 
 **失败是安全的**：万一外壳杀不掉（权限、被保护、系统卡住），助手**什么都不拉起**就退出。
 此时宿主还活着、界面照旧，绝不会出现「界面已经死了、新实例又被单实例锁挡回去」那种
-两头不靠的状态。前端有个看门狗：过了 `probeAfterMs` 页面居然还活着，就把这次重启的
-日志尾巴摆出来，告诉你为什么没成。
+两头不靠的状态。回包里带一个 `probeAfterMs`：过了这个点页面居然还活着，就说明这次重启
+没成 —— 想知道为什么，`GET /app-restart/api/log` 拿日志尾巴（见「HTTP 接口」）。
 
 **代价说清楚**：重启会**打断正在跑的任务**（这是重启的定义，不是副作用），Windows 上
 宿主是被系统连带清掉的，拿不到「优雅停机」那一步 —— 会话日志是逐个事件追加落盘的，
 丢数据的窗口和一次崩溃相当。要「先停干净再退出」的话，用托盘/菜单里的正常退出。
 
-## 前端
-
-- **确认框跑不掉**：点按钮先弹一个模态框，写清楚「应用会先退出、再自动打开，正在运行
-  的任务会被中断」。确认后按钮变灰、图标转圈、文案变「正在重启…」，这段时间不给「取消」
-  （避免半路松手留下不确定状态）。
-- **看门狗**：重启成功后整个页面会被新应用换掉，什么都不用做；但要是页面还活着，
-  到了 `probeAfterMs` 就再问一次 `/status` —— 还答得上来，说明外壳没关掉，于是弹出
-  「重启没有生效」+ 日志尾巴 + 日志路径。
-- **不支持时禁用**：如果这个 Host 不是桌面端（比如 `dsh web`），按钮禁用，鼠标悬停能
-  看到原因（`title` 与浮层都有）。
-- primitives 缺件全部有兜底：没有 `IconRefreshOutlineRegular` 就自绘一个 16px SVG 刷新
-  图标，没有 `Modal` / `Button` 就自绘（遮罩点击、Escape 都留着）。
-
 ## 斜杠命令 `/restart`
 
-界面零足迹的那条路：输入框打 `/` 就会在命令菜单里看到它，而且和内置命令长得一样 ——
+界面零足迹：输入框打 `/` 就会在命令菜单里看到它，而且和内置命令长得一样 ——
 **刷新图标 + 中文名 + 英文命令名 + 右侧说明**（和「模型 model」「下载日志 export」同一排面）。
 
 ```
@@ -125,8 +112,16 @@ dsh plugin --profile desktop add "file:C:/Users/prince/Desktop/dsh-plugin/dsh-ap
 - 它是 `commandUi.register({ name, label, description, icon, available, ui })` ——
   **客户端贡献**，不是宿主命令。`label` / `description` 是函数（每次投影重读，跟着语言走），
   `icon` 传组件本身，`ui.kind: "action"` 的 `run()` 在「菜单选中」和「打命令回车」两条路上
-  都会跑，里面打的是同一个 `POST /app-restart/api/restart`。
-- 命令**没有二次确认**：它是你明确打出来的，再来一次点击确认没有意义。要确认就走按钮。
+  都会跑，里面打的是 `POST /app-restart/api/restart`。
+- 命令**没有二次确认**：它是你明确打出来的，再来一次点击确认没有意义。
+- 失败会弹窗（客户端没有 toast 服务）：非桌面端、已经有一次重启在路上、host 半没加载，
+  都会把宿主给的原话摆出来 —— 绝不让「其实没重启」被当成重启成功了。
+- 图标是**照抄** primitives 的 `IconRefreshOutlineRegular`（16px、1px 描边的刷新箭头），
+  不是 `require('@deepseek-ai/dsh-client-ui-primitives')`：DSH 的插件规则
+  （`cordis-plugin-development/references/practices.md`）明说不要把 Client 包当模块加载
+  —— 它们随版本变、纯 JS 插件没有类型检查，而一个抛错的组件会把整个位置打空。
+  抄进来的只有两段 SVG 路径，连主题变量都不需要。`test-client.mjs` 里那条
+  「只从模块基座取 React」就是钉这件事的。
 - 只能打英文名 `/restart`（宿主命令能靠本地化 claim token 支持 `/计划` 那种写法，
   客户端贡献是按名字直接匹配的）。菜单里搜「重启」也能把它筛出来（`rankByName` 会看 label）。
 
@@ -180,7 +175,7 @@ Invoke-RestMethod -Headers @{ 'x-dsh-plugin-call' = 'app-restart' } `
 什么时候发的 SIGTERM、两个进程分别什么时候消失、有没有补刀、重新拉起的 pid、
 以及失败时的原因（`ABORT: shell ... is still alive`）。
 
-助手**不删**日志 —— 出问题时前端会把尾巴直接显示出来。
+助手**不删**日志 —— 出问题时 `GET /log` 就能把尾巴取出来。
 
 可用环境变量微调时间预算（单位毫秒，都会被钳制在合理区间内）：
 `DSH_APP_RESTART_SETTLE_MS`、`DSH_APP_RESTART_SHELL_TIMEOUT_MS`、
@@ -191,7 +186,7 @@ Invoke-RestMethod -Headers @{ 'x-dsh-plugin-call' = 'app-restart' } `
 
 ```powershell
 node test-host.mjs      # 52 项
-node test-client.mjs    # 71 项
+node test-client.mjs    # 41 项
 ```
 
 - `test-host.mjs`：注册契约、HTTP 行为（含跨站防线与各种拒绝），以及**把重启助手真的
@@ -199,9 +194,11 @@ node test-client.mjs    # 71 项
   `disconnect`），验证「杀外壳 → 宿主随之消失 → 重新拉起」这条链路，并检查重新拉起时
   环境确实洗干净了（`ELECTRON_RUN_AS_NODE` 被剥掉）；另外覆盖「外壳早就没了」、
   「宿主不肯自己退 → 补刀」、「外壳杀不掉 → 放弃且不拉起任何东西」三条分支。
-- `test-client.mjs`：mock Module Loader / 迷你 React 运行时 / primitives / fetch / document，
-  把组件真的渲染出来，走完「挂载问状态 → 点击 → 确认 → 发请求 → 正在重启 → 看门狗」，
-  并覆盖失败、不支持、窄栏、primitives 缺件、没有 `t` 等降级路径。
+- `test-client.mjs`：mock Module Loader / React / fetch / window，把客户端半真的装起来，
+  盯注册契约、菜单行的图标与中英文案、`run()` 打出去的请求（方法/头/body）、
+  失败弹窗（非桌面端 / busy / host 半缺席 / 连弹窗都抛），以及降级路径
+  （没有 `commandUi`、`scope.get` 抛错、没有 `ctx.inject`、绑不到 `t`）。里面的 `require`
+  是严格的：除了基座里的 `react` 之外任何 require 都会让测试当场红。
 
 两个测试都**不会**碰正在运行的 DSH：替身进程都是自己拉起来自己收掉的。
 
@@ -209,7 +206,9 @@ node test-client.mjs    # 71 项
 
 - 重启**不带启动参数**（外壳只认 `--updated` 那个更新器交接参数）。桌面端本来也不吃
   别的启动参数，所以等价于用户从开始菜单再打开一次。
-- 只覆盖桌面端。终端里的 `dsh web` 没有外壳可关，按钮会禁用并说明原因。
+- 只覆盖桌面端。终端里的 `dsh web` 没有外壳可关，命令会报错并说明原因。
+- **没有按钮、也没有二次确认**（这是刻意的：界面零足迹，只有明确打出来的命令才算数）。
+  辅助功能上唯一的「确认」是命令菜单里那行字本身。
 - 会打断正在跑的任务，且 Windows 上不是优雅停机（见上）。
 - 路由在 127.0.0.1 上、没有鉴权：**本机**任何进程都能调它重启应用。桌面端本来就假定
   本机可信，这里只是把它写明。
@@ -220,4 +219,4 @@ node test-client.mjs    # 71 项
 dsh plugin --profile desktop remove dsh-app-restart
 ```
 
-然后重启一次 DSH。临时目录里的日志可以随手删掉。
+然后重启一次 DSH（插件已经卸掉了，这次得手动退出再打开）。临时目录里的日志可以随手删掉。

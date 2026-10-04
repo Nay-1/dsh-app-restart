@@ -1,13 +1,13 @@
 /**
  * dsh-app-restart — Client 半自测。
  *
- * 用 mock 的 Module Loader / React 运行时 / primitives / fetch / document 把客户端
- * 插件真的跑起来：注册契约、宽窄两种形态、二次确认、重启请求、看门狗、失败与
- * 「不支持」的降级路径，以及 primitives 缺件时的兜底，都过一遍。
+ * 客户端这一半现在只做一件事：贡献 `/restart` 命令。所以这里盯的是
+ * 「注册契约 + 菜单行长相 + 真的打出请求 + 失败要吵」这四件事，
+ * 外加几条降级路径（没有 commandUi / 没有 t / 弹不出提示）。
  *
- * 迷你 React 运行时支持这个组件真正用到的 hook（useState / useEffect / useRef），
- * 并按依赖数组判断要不要重跑 effect —— 所以「点按钮 → 确认 → 发请求 → 变成正在重启」
- * 这条链路是真的被跑到的，不是手工塞 state 装出来的。
+ * 用 mock 的 Module Loader / React / fetch / window 把它真的跑起来：
+ * `require` 是严格的 —— 除了 `react`（模块基座）之外的任何 require 都会让测试当场红，
+ * 这条正好钉住「不要把 Client 包当模块加载」这条插件规则。
  *
  * 运行：node test-client.mjs
  */
@@ -24,15 +24,7 @@ const check = (label, condition, extra) => {
   }
 };
 
-/* ---- 迷你 React 运行时 --------------------------------------------------- */
-const sameDeps = (a, b) => Array.isArray(a) && Array.isArray(b)
-  && a.length === b.length && a.every((value, index) => value === b[index]);
-
-let hooks = [];
-let cursor = 0;
-let pendingEffects = [];
-let dirty = false;
-
+/* ---- mock 环境 ----------------------------------------------------------- */
 const React = {
   Fragment: Symbol.for("react.fragment"),
   createElement(type, props, ...children) {
@@ -41,149 +33,56 @@ const React = {
     const next = { ...(props ?? {}) };
     if (flat.length > 0) next.children = flat.length === 1 ? flat[0] : flat;
     return { __el: true, type, props: next };
-  },
-  useState(initial) {
-    const index = cursor++;
-    if (!(index in hooks)) hooks[index] = typeof initial === "function" ? initial() : initial;
-    const set = (value) => {
-      const next = typeof value === "function" ? value(hooks[index]) : value;
-      if (next === hooks[index]) return;
-      hooks[index] = next;
-      dirty = true;
-    };
-    return [hooks[index], set];
-  },
-  useEffect(fn, deps) {
-    const index = cursor++;
-    const previous = hooks[index];
-    if (previous === undefined || !sameDeps(previous.deps, deps)) pendingEffects.push(fn);
-    hooks[index] = { deps };
-  },
-  useRef(value) {
-    const index = cursor++;
-    if (!(index in hooks)) hooks[index] = { current: value };
-    return hooks[index];
   }
 };
 
-/** 挂一个组件实例：render() 渲染 + 冲 effects + 必要时重渲染。 */
-const mount = (Component, props) => {
-  const self = {
-    hooks: [],
-    tree: null,
-    render() {
-      for (let round = 0; round < 40; round += 1) {
-        hooks = self.hooks;
-        cursor = 0;
-        pendingEffects = [];
-        dirty = false;
-        self.tree = Component(props);
-        const effects = pendingEffects;
-        pendingEffects = [];
-        for (const effect of effects) effect();
-        if (!dirty) return self.tree;
-      }
-      throw new Error("渲染没有收敛：effect 一直在改状态");
-    },
-    /** 等异步链路（fetch/定时器）落定，并在状态变化后重渲染。 */
-    async settle(rounds = 12) {
-      for (let index = 0; index < rounds; index += 1) {
-        await new Promise((resolve) => setTimeout(resolve, 5));
-        if (dirty || pendingEffects.length > 0) self.render();
-      }
-      return self.tree;
-    }
-  };
-  return self;
+/** 严格的 require：只认基座里的 react。 */
+const required = [];
+const requireShim = (name) => {
+  required.push(name);
+  if (name === "react") return React;
+  throw new Error(`unexpected require: ${name}`);
 };
 
-/* ---- 元素树工具 ---------------------------------------------------------- */
-const childrenOf = (node) => {
-  if (node === null || node === undefined || node.__el !== true) return [];
-  const kids = node.props?.children;
-  if (kids === undefined || kids === null || kids === false) return [];
-  return Array.isArray(kids) ? kids.filter((kid) => kid !== null && kid !== undefined) : [kids];
-};
-
-const findAll = (node, predicate, found = []) => {
-  if (node === null || node === undefined || node.__el !== true) return found;
-  if (predicate(node)) found.push(node);
-  for (const kid of childrenOf(node)) findAll(kid, predicate, found);
-  return found;
-};
-
-const texts = (node) => findAll(node, () => false).length === 0 && typeof node === "string"
-  ? [node]
-  : (() => {
-    const out = [];
-    const visit = (value) => {
-      if (typeof value === "string") out.push(value);
-      else if (Array.isArray(value)) value.forEach(visit);
-      else if (value !== null && typeof value === "object" && value.__el === true) childrenOf(value).forEach(visit);
-    };
-    visit(node);
-    return out;
-  })();
-
-const byText = (node, needle) => texts(node).some((text) => text.includes(needle));
-
-/* ---- mock 环境 ----------------------------------------------------------- */
-let loaderSpec;
-const registered = [];
-const injectedSlots = [];
-const localeRegistrations = [];
-const styleTags = [];
-const fetchCalls = [];
-
-globalThis.window = { __ModuleLoader__: { load: (spec) => { loaderSpec = spec; } } };
-globalThis.document = {
-  head: {
-    appendChild: (tag) => { styleTags.push(tag); },
-    removeChild: () => {}
-  },
-  createElement: () => ({ dataset: {}, remove: () => {} }),
-  querySelector: () => null,
-  addEventListener: () => {},
-  removeEventListener: () => {}
+const alerts = [];
+globalThis.window = {
+  __ModuleLoader__: { load: (spec) => { loaderSpec = spec; } },
+  alert: (message) => { alerts.push(String(message)); }
 };
 
 /** 每次 fetch 的应答由这里决定，测试中途可以换。 */
-let responder = async () => ({ status: 200, json: async () => ({ ok: true, result: { supported: true, mode: "desktop" } }) });
+let responder = async () => ({ status: 200, json: async () => ({ ok: true, result: { probeAfterMs: 7500 } }) });
+const fetchCalls = [];
 globalThis.fetch = async (url, init) => {
   fetchCalls.push({ url, init });
   return responder(url, init);
 };
 
-const IconRefreshOutlineRegular = function IconRefreshOutlineRegular() {};
-const Tooltip = function Tooltip() {};
-const Modal = function Modal() {};
-const Button = function Button() {};
-
-let primitivesOverride;
-const requireShim = (name) => {
-  if (name === "react") return React;
-  if (name === "@deepseek-ai/dsh-client-ui-primitives") {
-    if (primitivesOverride !== undefined) return primitivesOverride;
-    return { IconRefreshOutlineRegular, Tooltip, Modal, Button };
-  }
-  throw new Error(`unexpected require: ${name}`);
-};
-
 /* ---- 加载 client 半 ------------------------------------------------------- */
+let loaderSpec;
 await import(new URL("./lib/client.js", import.meta.url).href);
 check("Module Loader 收到注册调用", loaderSpec !== undefined);
 check("loader id 与包名一致", loaderSpec?.id === "dsh-app-restart");
 
 const mod = loaderSpec.factory(requireShim);
+check("只从模块基座取 React", required.length === 1 && required[0] === "react", required.join(", "));
 check("导出 apply", typeof mod.apply === "function");
-check("导出 inject（slots / locale）",
-  Array.isArray(mod.inject) && ["slots", "locale"].every((key) => mod.inject.includes(key)));
+check("inject 只硬依赖 locale", Array.isArray(mod.inject) && mod.inject.length === 1 && mod.inject[0] === "locale");
 
-/* ---- 应用 ---------------------------------------------------------------- */
+/* ---- 装起来 --------------------------------------------------------------- */
+const localeRegistrations = [];
+const locale = {
+  register: (ns, dicts) => { localeRegistrations.push({ ns, dicts }); },
+  bind: (ns) => (key, params) => {
+    const template = localeRegistrations.at(-1)?.dicts?.zh?.[key] ?? key;
+    if (params === undefined) return template;
+    return Object.keys(params).reduce((text, name) => text.split(`{${name}}`).join(String(params[name])), template);
+  }
+};
+
 const injections = [];
 const commandContributions = [];
 const commandEffects = [];
-/** 让「commandUi 缺席」那条降级路径可测：置为 undefined 时 scope.get 就取不到。 */
 let commandUiService = {
   register: (contribution) => {
     commandContributions.push(contribution);
@@ -191,17 +90,9 @@ let commandUiService = {
   }
 };
 
-const ctx = {
-  effect: (fn) => { const disposer = fn(); return disposer; },
-  locale: {
-    register: (ns, dicts) => { localeRegistrations.push({ ns, dicts }); },
-    bind: (ns) => (key, params) => {
-      const template = localeRegistrations.at(-1)?.dicts?.zh?.[key] ?? key;
-      if (params === undefined) return template;
-      return Object.keys(params).reduce((text, name) => text.split(`{${name}}`).join(String(params[name])), template);
-    }
-  },
-  // cordis 的 scoped inject：依赖齐了就带着子 scope 跑回调（ui-conversation 的 /file 就是这么注册的）。
+const makeCtx = (overrides = {}) => ({
+  effect: (fn) => fn(),
+  locale,
   inject: (deps, callback) => {
     injections.push(deps);
     callback({
@@ -209,264 +100,140 @@ const ctx = {
       effect: (fn, label) => { const disposer = fn(); commandEffects.push(label); return disposer; }
     });
   },
-  slots: {
-    inject: (name, install) => { injectedSlots.push(name); install(); },
-    register: (spec, Component) => { registered.push({ spec, Component }); }
-  }
-};
+  ...overrides
+});
 
-mod.apply(ctx);
+mod.apply(makeCtx());
 
 check("注册了 zh/en 字典", localeRegistrations.length === 1
   && localeRegistrations[0].ns === "app-restart"
-  && localeRegistrations[0].dicts.zh["action.restart"] === "重启"
-  && typeof localeRegistrations[0].dicts.en["action.restart"] === "string"
-  && localeRegistrations[0].dicts.zh["menu.label"] === "重启");
-check("注入了样式标签", styleTags.length === 1 && String(styleTags[0].textContent).includes(".dsr-row"));
-check("向 sidebar.footer.action 注入了插槽", injectedSlots.includes("sidebar.footer.action"));
-check("只注册了一个入口", registered.length === 1);
-
-/* ---- 0b. 斜杠命令：客户端贡献 -------------------------------------------- */
-// 宿主命令拿不到 `/` 菜单的图标与中文名（builtinRowFace 只认内置表），
-// 而且宿主目录与同名贡献会撞车 —— 所以命令必须由这里注册。
+  && localeRegistrations[0].dicts.zh["menu.label"] === "重启"
+  && typeof localeRegistrations[0].dicts.en["menu.label"] === "string");
+check("字典里只有命令用得到的几条",
+  Object.keys(localeRegistrations[0].dicts.zh).every((key) => key.startsWith("menu.") || key.startsWith("error.")));
+check("没有注册任何 slot（界面零足迹）", !("slots" in mod.inject) && !/slots/.test(required.join(",")));
 check("要了 commandUi 服务（scoped inject）", injections.length === 1 && injections[0][0] === "commandUi");
 check("注册了一条命令贡献", commandContributions.length === 1);
-check("在 scope.effect 里注册（可卸载）", commandEffects.length === 1 && commandEffects[0] === "app-restart: /restart command");
+check("在 scope.effect 里注册（可卸载）",
+  commandEffects.length === 1 && commandEffects[0] === "app-restart: /restart command");
+
+/* ---- 命令贡献的行长相 ----------------------------------------------------- */
+console.log("\n[1] 命令贡献");
 
 const command = commandContributions[0];
 check("命令名是 restart", command?.name === "restart");
 check("中文名是「重启」（菜单左侧那一栏）", command?.label?.() === "重启");
 check("带一句说明（菜单右侧）", String(command?.description?.() ?? "").includes("重新拉起"));
-check("图标给的是刷新图标组件本身", command?.icon === IconRefreshOutlineRegular);
+check("label / description 是 thunk（切语言时重读）",
+  typeof command?.label === "function" && typeof command?.description === "function");
 check("available 是同步可判定的", command?.available?.({}) === true);
-check("ui 是 action 型（附着附件也不拦）", command?.ui?.kind === "action" && typeof command?.ui?.run === "function");
-check("label 是 thunk（切换语言时会重读）", typeof command?.label === "function");
+check("ui 是 action 型", command?.ui?.kind === "action" && typeof command?.ui?.run === "function");
+check("图标给的是组件本身（不是 element）", typeof command?.icon === "function" && command.icon.__el === undefined);
 
-const entry = registered[0];
-check("slot 名正确", entry.spec.name === "sidebar.footer.action");
-check("id 稳定", entry.spec.id === "app-restart");
-check("order=60（排在 Cordis 面板之后、设置之前）", entry.spec.order === 60);
-check("locale 命名空间正确", entry.spec.locale === "app-restart");
-const face = entry.spec.inject();
-check("inject face 暴露 host 接口", typeof face.api?.restart === "function"
-  && typeof face.api?.readStatus === "function" && typeof face.api?.readLog === "function");
+/* ---- 图标：照抄 primitives 的那枚刷新箭头 --------------------------------- */
+console.log("\n[2] 图标");
 
-/** 复用的翻译函数，模拟 slot 注入的 t。 */
-const t = (key) => localeRegistrations[0].dicts.zh[key] ?? key;
+const icon = command.icon({});
+check("是 16px 的 svg", icon?.type === "svg" && icon.props.width === 16 && icon.props.height === 16);
+check("viewBox 与内置图标一致", icon?.props?.viewBox === "0 0 16 16");
+check("按 1px 描边画（Regular 那一档）", icon?.props?.strokeWidth === 1);
+check("对读屏隐藏", icon?.props?.["aria-hidden"] === "true");
+const paths = (Array.isArray(icon?.props?.children) ? icon.props.children : [icon?.props?.children]);
+check("两条 currentColor 路径（弧 + 箭头）", paths.length === 2
+  && paths.every((path) => path?.type === "path" && path.props.stroke === "currentColor"));
+check("路径数据与 primitives 逐字一致",
+  String(paths[0]?.props?.d).startsWith("M14.5001 8C14.5 9.28552") && paths[1]?.props?.d === "M14.4999 1.5V5.1H10.8999");
+check("size 可以被调用方覆盖", command.icon({ size: 20 })?.props?.width === 20);
 
-/* ---- 1. 宽态渲染 --------------------------------------------------------- */
-console.log("\n[1] 宽态（侧栏展开）");
+/* ---- 真的能触发重启 ------------------------------------------------------- */
+console.log("\n[3] /restart 的行为");
 
-const wide = mount(entry.Component, { wide: true, t, api: face.api });
-let tree = wide.render();
-tree = await wide.settle(4);
+const settle = () => new Promise((resolve) => setTimeout(resolve, 20));
 
-const buttonOf = (node) => findAll(node, (element) => element.type === "button" && String(element.props.className ?? "").startsWith("dsr-"))[0];
-let button = buttonOf(tree);
-check("渲染出一个底部行按钮", button !== undefined);
-check("用整行样式 dsr-row", button?.props.className === "dsr-row");
-check("文案是「重启」", byText(button, "重启"));
-check("里面是刷新图标（不是文字图标）", findAll(button, (element) => element.type === IconRefreshOutlineRegular).length === 1);
-// 组件总是渲染一个 Modal 元素，关着的时候由 Modal 自己返回 null（primitives 的真实行为）。
-check("未点开时对话框是关着的", findAll(tree, (element) => element.type === Modal)[0]?.props.open === false);
-check("挂载时问过一次宿主能力", fetchCalls.length === 1 && fetchCalls[0].url === "/app-restart/api/status");
-check("状态查询带上调用头", fetchCalls[0].init.headers["x-dsh-plugin-call"] === "app-restart");
-check("能力可用时按钮可用", button?.props.disabled === false);
-
-/* ---- 2. 二次确认 --------------------------------------------------------- */
-console.log("\n[2] 二次确认与重启请求");
-
-button.props.onClick();
-tree = wide.render();
-let modal = findAll(tree, (element) => element.type === Modal)[0];
-check("点击后弹出确认框", modal !== undefined && modal.props.open === true);
-check("确认框标题问得清楚", String(modal.props.title).includes("重启"));
-check("确认框正文说明了会中断任务", byText(modal, "任务会被中断"));
-check("按钮文案变成确认项", byText(modal.props.footer, "立即重启") && byText(modal.props.footer, "取消"));
-check("还没发重启请求", fetchCalls.length === 1);
-
-const confirmButton = findAll(modal.props.footer, (element) => element.type === Button)[1];
-check("确认按钮是主按钮", confirmButton?.props.variant === "primary");
-confirmButton.props.onClick();
-tree = wide.render();
-check("确认后立刻进入「正在重启…」", byText(buttonOf(tree), "正在重启…"));
-check("重启中按钮被禁用", buttonOf(tree)?.props.disabled === true);
-check("重启中图标在转", findAll(tree, (element) => String(element.props.className ?? "").includes("dsr-spin")).length >= 1);
-
-await wide.settle(6);
-const restartCall = fetchCalls.find((call) => call.url === "/app-restart/api/restart");
-check("发出了 POST /app-restart/api/restart", restartCall !== undefined && restartCall.init.method === "POST");
-check("请求带 JSON content-type", restartCall?.init.headers["content-type"] === "application/json");
-check("请求带调用头", restartCall?.init.headers["x-dsh-plugin-call"] === "app-restart");
-tree = wide.render();
-modal = findAll(tree, (element) => element.type === Modal)[0];
-check("重启中对话框换成进度文案", String(modal?.props.title).includes("正在重启"));
-check("重启中不给「取消」按钮（避免半路松手）",
-  findAll(modal?.props.footer ?? {}, (element) => element.type === Button).length === 0);
-
-/* ---- 3. 看门狗：页面还活着说明没重启成 ----------------------------------- */
-console.log("\n[3] 看门狗");
-
-responder = async (url) => {
-  if (url.endsWith("/status")) {
-    return { status: 200, json: async () => ({ ok: true, result: { supported: true, mode: "desktop" } }) };
-  }
-  return { status: 200, json: async () => ({ ok: true, result: { logPath: "C:/tmp/restart.log", text: "terminate: SIGTERM -> shell 1234\nABORT: shell is still alive" } }) };
-};
-fetchCalls.length = 0;
-const watchdog = mount(entry.Component, { wide: true, t, api: face.api });
-let watchTree = watchdog.render();
-await watchdog.settle(4);
-buttonOf(watchTree).props.onClick();
-watchTree = watchdog.render();
-// 让 host 半回一个很短的 probeAfterMs，测试不用真等 8 秒。
-const quickApi = {
-  readStatus: () => face.api.readStatus(),
-  readLog: () => face.api.readLog(),
-  restart: async () => ({ probeAfterMs: 20, logPath: "C:/tmp/restart.log" })
-};
-watchdog.render();
-const quick = mount(entry.Component, { wide: true, t, api: quickApi });
-let quickTree = quick.render();
-await quick.settle(4);
-buttonOf(quickTree).props.onClick();
-quickTree = quick.render();
-findAll(quickTree, (element) => element.type === Modal)[0].props.footer.props.children[1].props.onClick();
-await quick.settle(30);
-quickTree = quick.render();
-const staleModal = findAll(quickTree, (element) => element.type === Modal)[0];
-check("看门狗到点后改报「重启没有生效」", String(staleModal?.props.title).includes("没有生效"));
-check("把日志尾巴摆了出来", byText(staleModal, "ABORT"));
-check("给出了日志路径", byText(staleModal, "C:/tmp/restart.log"));
-check("这种情况下的按钮回到可点状态", buttonOf(quickTree)?.props.disabled === false);
-
-/* ---- 4. 失败路径 --------------------------------------------------------- */
-console.log("\n[4] 失败与不支持");
-
-responder = async (url) => {
-  if (url.endsWith("/status")) {
-    return { status: 200, json: async () => ({ ok: true, result: { supported: true, mode: "desktop" } }) };
-  }
-  return { status: 409, json: async () => ({ ok: false, code: "unsupported", error: "当前进程不是 DSH 桌面端的 Host" }) };
-};
-const failing = mount(entry.Component, { wide: true, t, api: face.api });
-let failTree = failing.render();
-await failing.settle(4);
-buttonOf(failTree).props.onClick();
-failTree = failing.render();
-findAll(failTree, (element) => element.type === Modal)[0].props.footer.props.children[1].props.onClick();
-await failing.settle(10);
-failTree = failing.render();
-const failModal = findAll(failTree, (element) => element.type === Modal)[0];
-check("失败时留在对话框里报错", byText(failModal, "重启失败") && byText(failModal, "不是 DSH 桌面端的 Host"));
-check("失败后按钮恢复可点（可以再试）", buttonOf(failTree)?.props.disabled === false);
-
-responder = async () => ({
-  status: 200,
-  json: async () => ({ ok: true, result: { supported: false, mode: "unsupported", reasons: ["宿主没有连着外壳的 IPC 通道"] } })
-});
-const unsupported = mount(entry.Component, { wide: true, t, api: face.api });
-let unsupportedTree = unsupported.render();
-unsupportedTree = await unsupported.settle(6);
-button = buttonOf(unsupportedTree);
-check("非桌面端时按钮禁用", button?.props.disabled === true);
-check("禁用原因写在 title 上", String(button?.props.title ?? "").includes("IPC"));
-
-/* ---- 5. 窄栏形态 --------------------------------------------------------- */
-console.log("\n[5] 窄栏（侧栏收起）");
-
-responder = async () => ({ status: 200, json: async () => ({ ok: true, result: { supported: true, mode: "desktop" } }) });
-const rail = mount(entry.Component, { wide: false, t, api: face.api });
-let railTree = rail.render();
-railTree = await rail.settle(4);
-button = buttonOf(railTree);
-check("收起态画成圆形图标按钮", button?.props.className === "dsr-rail");
-check("收起态按钮有无障碍名字", button?.props["aria-label"] === "重启 DSH 桌面应用");
-check("收起态把按钮包进了 Tooltip", findAll(railTree, (element) => element.type === Tooltip).length === 1);
-check("收起态不画文字标签", !byText(button, "重启"));
-
-/* ---- 6. primitives 缺件时的兜底 ------------------------------------------ */
-console.log("\n[6] primitives 缺件兜底");
-
-primitivesOverride = {};
-const bareMod = loaderSpec.factory(requireShim);
-const bareRegistered = [];
-bareMod.apply({
-  effect: (fn) => fn(),
-  locale: ctx.locale,
-  slots: { inject: (name, install) => install(), register: (spec, Component) => bareRegistered.push({ spec, Component }) }
-});
-const bare = mount(bareRegistered[0].Component, { wide: true, t, api: face.api });
-let bareTree = bare.render();
-bareTree = await bare.settle(6);
-button = buttonOf(bareTree);
-check("没有 primitives 也能画出按钮", button !== undefined && button.props.className === "dsr-row");
-// 组件元素只是「要画什么」，真正画出来的是它的返回值 —— 自绘图标是组件，所以要调用一次。
-const iconElement = findAll(button, (element) => typeof element.type === "function")[0];
-check("图标退回自绘组件", typeof iconElement?.type === "function" && iconElement.type !== IconRefreshOutlineRegular);
-hooks = [];
-cursor = 0;
-pendingEffects = [];
-const drawnIcon = iconElement.type(iconElement.props ?? {});
-check("自绘图标真的画出一个 16px SVG", drawnIcon?.type === "svg" && drawnIcon.props?.viewBox === "0 0 16 16");
-
-bareTree = bare.render();
-buttonOf(bareTree).props.onClick();
-bareTree = bare.render();
-check("没有 primitives 也有确认框（自绘）", byText(bareTree, "任务会被中断"));
-// 同理：自绘 Modal 要用调用一次才算真的渲染出关闭按钮。
-const bareModal = findAll(bareTree, (element) => element.props?.open === true && typeof element.type === "function")[0];
-hooks = [];
-cursor = 0;
-pendingEffects = [];
-const bareModalTree = bareModal.type(bareModal.props);
-check("自绘确认框有关闭按钮",
-  findAll(bareModalTree, (element) => element.type === "button" && element.props.className === "dsr-modalClose").length === 1);
-check("自绘确认框的可访问名字是「取消」", byText(bareModalTree, "任务会被中断"));
-
-/* ---- 7. 无 t 时用内置中文 ------------------------------------------------ */
-console.log("\n[7] 没有 t 的降级");
-
-const noT = mount(bareRegistered[0].Component, { wide: true, api: face.api });
-const noTTree = noT.render();
-await noT.settle(4);
-check("没有注入 t 也显示中文", byText(buttonOf(noTTree), "重启"));
-
-/* ---- 8. 斜杠命令真的能触发重启 ------------------------------------------- */
-console.log("\n[8] /restart 的行为");
-
-const alerts = [];
-globalThis.window.alert = (message) => { alerts.push(String(message)); };
-
-responder = async () => ({ status: 200, json: async () => ({ ok: true, result: { probeAfterMs: 8000, logPath: "C:/tmp/restart.log" } }) });
-fetchCalls.length = 0;
 command.ui.run({});
-await new Promise((resolve) => setTimeout(resolve, 20));
-const commandCall = fetchCalls.find((call) => call.url === "/app-restart/api/restart");
-check("run() 打出 POST /app-restart/api/restart", commandCall !== undefined && commandCall.init.method === "POST");
-check("带上 JSON content-type", commandCall?.init.headers["content-type"] === "application/json");
-check("带上调用头", commandCall?.init.headers["x-dsh-plugin-call"] === "app-restart");
+await settle();
+let restartCall = fetchCalls.at(-1);
+check("run() 打出 POST /app-restart/api/restart",
+  restartCall?.url === "/app-restart/api/restart" && restartCall?.init.method === "POST");
+check("带上 JSON content-type", restartCall?.init.headers["content-type"] === "application/json");
+check("带上调用头（跨站防线）", restartCall?.init.headers["x-dsh-plugin-call"] === "app-restart");
+check("req body 是空对象（用宿主默认时间预算）", restartCall?.init.body === "{}");
 check("成功时不打扰用户", alerts.length === 0);
 
-responder = async () => ({ status: 409, json: async () => ({ ok: false, code: "unsupported", error: "当前进程不是 DSH 桌面端的 Host" }) });
+responder = async () => ({ status: 200, json: async () => ({ ok: true, result: { probeAfterMs: 7500 } }) });
 command.ui.run({});
-await new Promise((resolve) => setTimeout(resolve, 20));
-check("失败时明确报错（不让用户以为重启了）", alerts.length === 1 && alerts[0].includes("不是 DSH 桌面端的 Host"));
+command.ui.run({});
+await settle();
+check("菜单选中与回车两条路都走 run()（每次打一次请求）",
+  fetchCalls.filter((call) => call.url === "/app-restart/api/restart").length === 3);
 
-// commandUi 缺席：插件照样要装得上（按钮不能跟着一起没）。
-commandUiService = undefined;
-const noCommandUiSlots = [];
-mod.apply({
-  effect: (fn) => fn(),
-  locale: ctx.locale,
-  inject: (deps, callback) => callback({ get: () => undefined, effect: (fn) => fn() }),
-  slots: {
-    inject: (name, install) => { noCommandUiSlots.push(name); install(); },
-    register: () => {}
-  }
+/* ---- 失败要吵 ------------------------------------------------------------- */
+console.log("\n[4] 失败路径");
+
+responder = async () => ({
+  status: 409,
+  json: async () => ({ ok: false, code: "unsupported", error: "当前进程不是 DSH 桌面端的 Host，不能重启桌面应用：宿主没有连着外壳的 IPC 通道" })
 });
-check("没有 commandUi 时按钮插槽照样注册", noCommandUiSlots.includes("sidebar.footer.action"));
-check("没有 commandUi 时不会抛错（apply 走完）", true);
+command.ui.run({});
+await settle();
+check("非桌面端时明确报错（不让用户以为重启了）",
+  alerts.length === 1 && alerts[0].includes("重启失败") && alerts[0].includes("不是 DSH 桌面端的 Host"));
+check("把宿主给的原因也带出来", alerts.at(-1)?.includes("IPC"));
+
+responder = async () => ({
+  status: 409,
+  json: async () => ({ ok: false, code: "busy", error: "已经有一次重启在路上了" })
+});
+command.ui.run({});
+await settle();
+check("busy 也说清楚", alerts.at(-1)?.includes("已经有一次重启在路上了"));
+
+// host 半没加载：路由不存在，回的不是 JSON。
+responder = async () => ({ status: 404, json: async () => { throw new Error("not json"); } });
+command.ui.run({});
+await settle();
+check("host 半缺席时报「接口没有响应」", alerts.at(-1)?.includes("重启接口没有响应"));
+
+// 弹窗本身被挡（有些环境会抛）：不能变成未处理的 rejection。
+const before = alerts.length;
+globalThis.window.alert = () => { throw new Error("alert blocked"); };
+responder = async () => ({ status: 500, json: async () => ({ ok: false, error: "boom" }) });
+command.ui.run({});
+await settle();
+check("弹不出提示也不会炸（apply 之后照常活着）", alerts.length === before);
+
+/* ---- 降级路径 ------------------------------------------------------------- */
+console.log("\n[5] 降级路径");
+
+// commandUi 取不到（profile 里没有 ui-commands）：插件照样要装得上。
+commandUiService = undefined;
+const beforeContributions = commandContributions.length;
+mod.apply(makeCtx());
+check("没有 commandUi 时不注册、也不抛错", commandContributions.length === beforeContributions);
+
+// scope.get 直接抛（镸得更歪的宿主实现）。
+mod.apply(makeCtx({ inject: (deps, callback) => callback({ get: () => { throw new Error("nope"); }, effect: (fn) => fn() }) }));
+check("scope.get 抛错也只是不注册", commandContributions.length === beforeContributions);
+
+// 连 ctx.inject 都没有。
+let threw;
+try {
+  mod.apply({ effect: (fn) => fn(), locale });
+  threw = false;
+} catch (error) {
+  threw = true;
+  console.log(`    ${error?.message}`);
+}
+check("没有 ctx.inject 时 apply 不抛错", threw === false);
+
+// 没有绑上 t：用内置中文。
+commandUiService = {
+  register: (contribution) => { commandContributions.push(contribution); return () => {}; }
+};
+mod.apply(makeCtx({ locale: { register: (ns, dicts) => { localeRegistrations.push({ ns, dicts }); } } }));
+const bare = commandContributions.at(-1);
+check("绑不到 t 时菜单名还是中文", bare?.label?.() === "重启");
+check("绑不到 t 时说明还是中文", String(bare?.description?.() ?? "").includes("重新拉起"));
 
 console.log(`\n${failed === 0 ? "全部通过" : "有失败项"}：${pass} 通过 / ${failed} 失败`);
 process.exitCode = failed === 0 ? 0 : 1;
