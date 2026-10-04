@@ -94,7 +94,23 @@ dsh plugin --profile desktop add "file:C:/Users/prince/Desktop/dsh-plugin/dsh-ap
 **失败是安全的**：万一外壳杀不掉（权限、被保护、系统卡住），助手**什么都不拉起**就退出。
 此时宿主还活着、界面照旧，绝不会出现「界面已经死了、新实例又被单实例锁挡回去」那种
 两头不靠的状态。回包里带一个 `probeAfterMs`：过了这个点页面居然还活着，就说明这次重启
-没成 —— 想知道为什么，`GET /app-restart/api/log` 拿日志尾巴（见「HTTP 接口」）。
+没成 —— **客户端自己会盯着它**（见下），不需要用户去猜。
+
+**失败也是可以重试的**：一次重启在路上的标记会在「助手没了 + 宿主还活着」时自动清掉 ——
+那个组合只有一个含义，就是上一次没成（外壳杀不掉、或者助手自己崩了）。所以 `/restart`
+不会被一次失败永久锁死在 `busy` 上；被清掉时会把上一次的 `logPath` 与结局留在
+`GET /status` 的 `previous` 里，客户端报错时顺手把日志里「为什么没成」的那句（
+`ABORT: shell … is still alive`）摆出来。
+
+**`/restart` 之后客户端会自查一次**：回包成功只代表助手已经上路，不代表外壳真的会死。
+`run()` 拿到回包后按 `probeAfterMs` 起一个定时器（不占界面、不阻塞、也不会拖着页面），
+到点后：
+
+| 自查看到什么 | 客户端怎么做 |
+|---|---|
+| `GET /status` 说 `restarting: true` | 助手还在路上（可能正等外壳退出），按 `probeAfterMs` 再看一轮，最多 4 轮 |
+| `restarting: false` 而页面还活着 | 助手已经结束、外壳却没死 → 弹窗说清「这次重启没有生效」，并附上宿主日志里最值得看的那一句 |
+| 接口整个问不到 | 一声不吭 —— 页面马上要没了（重启真的在进行），或者宿主已经换了一茬 |
 
 **代价说清楚**：重启会**打断正在跑的任务**（这是重启的定义，不是副作用），Windows 上
 宿主是被系统连带清掉的，拿不到「优雅停机」那一步 —— 会话日志是逐个事件追加落盘的，
@@ -152,14 +168,22 @@ goal / feedback…），**第三方宿主命令永远查不到**，只能退回 
 （带 `Origin` 时）`Origin` 的 host 必须等于 `Host` —— 插件的前缀路由不受 DSH 鉴权网关
 保护，这道防线让浏览器里任意网页都发不出重启请求；同源 fetch 不受影响。
 
+「没有 `Origin`」与「`Origin: null`」是两回事：前者是本机脚本、以及**桌面端外壳转发**
+（外壳的 `forwardWebRequest` 会把 `origin` 头剥掉再转发到宿主），放行；后者是 sandbox
+iframe / `data:` / `file:` 页面发出来的浏览器请求，一律当跨站拒绝。
+
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| GET | `/status` | 能不能重启、外壳/宿主 pid、exe 路径、是否正在重启、日志路径 |
+| GET | `/status` | 能不能重启、外壳/宿主 pid、exe 路径、是否正在重启（`restarting` / `starting` / `helperAlive` / `previous`）、日志路径 |
 | GET | `/log` | 最近一次重启的日志尾巴（最多 12 KB），没有则 404 |
 | POST | `/restart` | 触发重启。可选 body：`settleMs` / `shellTimeoutMs` / `forceTimeoutMs` / `hostTimeoutMs` / `quietMs` |
 
+`GET /status` 与 `/restart` 都会顺手清掉「上一次其实早就结束了」的陈旧标记，所以它返回的
+`restarting` 永远是**现在**的真相：`previous` 是上一次的 `{ logPath, outcome }`，
+`outcome` 取 `aborted`（外壳杀不掉那条安全失败）/ `relaunch-failed` / `relaunched` / `unknown`。
+
 返回统一是 `{ ok: true, result }` 或 `{ ok: false, code?, error }`；非桌面宿主是
-`409 + code: "unsupported"`。
+`409 + code: "unsupported"`，已经有一次在路上是 `409 + code: "busy"`。
 
 排查可以直接问它：
 
@@ -172,8 +196,17 @@ Invoke-RestMethod -Headers @{ 'x-dsh-plugin-call' = 'app-restart' } `
 
 每次重启一个运行目录：`%TEMP%\dsh-app-restart\<时间戳>-<宿主 pid>\restart.log`，
 只保留最近 5 次（更老的会在下一次重启时清掉）。里面按时间戳记着：计划里的时间参数、
-什么时候发的 SIGTERM、两个进程分别什么时候消失、有没有补刀、重新拉起的 pid、
+什么时候发的 SIGTERM、两个进程分别什么时候消失、有没有补刀、重新拉起的 pid，
 以及失败时的原因（`ABORT: shell ... is still alive`）。
+
+结尾固定是一句**机器可读的收尾行**，宿主半与客户端就是靠它判断上一次的结局：
+
+| 收尾行 | 含义 |
+|---|---|
+| `helper done: {"relaunched":true,"pid":…}` | 应用已经重新拉起 |
+| `helper done: {"relaunched":false,"reason":"shell-alive"}` | 安全失败：外壳杀不掉，什么都没动 |
+| `helper done: {"relaunched":false,"reason":"spawn-failed"}` | 外壳没了，但重新拉起失败 |
+| `helper crashed: …` | 助手自己崩了（这时应用多半还在） |
 
 助手**不删**日志 —— 出问题时 `GET /log` 就能把尾巴取出来。
 
@@ -185,22 +218,58 @@ Invoke-RestMethod -Headers @{ 'x-dsh-plugin-call' = 'app-restart' } `
 ## 自测
 
 ```powershell
-node test-host.mjs      # 52 项
-node test-client.mjs    # 41 项
+node test-host.mjs      # 77 项
+node test-client.mjs    # 51 项
 ```
 
-- `test-host.mjs`：注册契约、HTTP 行为（含跨站防线与各种拒绝），以及**把重启助手真的
-  跑一遍** —— 用两个一次性替身进程模拟「外壳 + 宿主」（替身宿主和真宿主一样监听
-  `disconnect`），验证「杀外壳 → 宿主随之消失 → 重新拉起」这条链路，并检查重新拉起时
-  环境确实洗干净了（`ELECTRON_RUN_AS_NODE` 被剥掉）；另外覆盖「外壳早就没了」、
-  「宿主不肯自己退 → 补刀」、「外壳杀不掉 → 放弃且不拉起任何东西」三条分支。
+- `test-host.mjs`：注册契约、`plan` 归一化（纯函数，直接 `require` 助手拿它）、
+  HTTP 行为（含跨站防线与各种拒绝），以及**把重启助手真的跑一遍** —— 用两个一次性替身
+  进程模拟「外壳 + 宿主」（替身宿主和真宿主一样监听 `disconnect`），验证「杀外壳 →
+  宿主随之消失 → 重新拉起」这条链路，并检查重新拉起时环境确实洗干净了
+  （`ELECTRON_RUN_AS_NODE` 被剥掉）；另外覆盖「外壳早就没了」、「宿主不肯自己退 →
+  补刀」、「外壳杀不掉 → 放弃且不拉起任何东西」三条分支。
+  最后一段用一个**替身桌面宿主**（入口文件名就叫 `dsh-desktop-host/lib/index.js`、
+  由带 IPC 通道的替身外壳拉起 —— 两个结构性判据都对得上）把宿主半装起来，
+  对真的 HTTP 路由打真实请求，钉住状态机：**两个并发 POST 恰好一个 200、一个 409**；
+  助手被杀掉之后陈旧标记自己清掉、可以立刻重试；日志里出现收尾行时即使助手进程还在，
+  也按「已经结束」判定，结局是 `aborted`。
 - `test-client.mjs`：mock Module Loader / React / fetch / window，把客户端半真的装起来，
   盯注册契约、菜单行的图标与中英文案、`run()` 打出去的请求（方法/头/body）、
   失败弹窗（非桌面端 / busy / host 半缺席 / 连弹窗都抛），以及降级路径
-  （没有 `commandUi`、`scope.get` 抛错、没有 `ctx.inject`、绑不到 `t`）。里面的 `require`
-  是严格的：除了基座里的 `react` 之外任何 require 都会让测试当场红。
+  （没有 `commandUi`、`scope.get` 抛错、没有 `ctx.inject`、绑不到 `t`）。最后一段专测
+  **重启之后的自查**：外壳没杀掉要报出来并带上日志里「为什么没成」的那句、助手还在路上时
+  要按 `probeAfterMs` 继续等而不是急着下结论、探测期接口问不到时一声不吭、
+  宿主没给 `probeAfterMs` 时用兜底间隔。里面的 `require` 是严格的：除了基座里的 `react`
+  之外任何 require 都会让测试当场红。
 
-两个测试都**不会**碰正在运行的 DSH：替身进程都是自己拉起来自己收掉的。
+两个测试都**不会**碰正在运行的 DSH：替身进程都是自己拉起来自己收掉的；
+助手是用 `settleMs=15000` 拉起来的（测完就被收掉，绝不会真的去杀外壳）。
+
+## 1.3.0 修了什么
+
+对着 DSH 0.2.0-rc.2 的源码（`app.asar` 里的 `dsh/`）与运行中的桌面端复核了一遍，修掉四处：
+
+| | 问题 | 现在 |
+|---|---|---|
+| 1 | 一次失败的重启会把 `/restart` **永久**锁死在 `busy`（标记只置不清，只能手动退出再打开） | 「助手没了 + 宿主还活着」= 上一次没成 → 标记自动清掉、可以立刻重试，`/status` 里留 `previous` |
+| 2 | 判忙与置位之间隔着三个 `await`，**两个并发请求会各自拉起一个助手** | 判忙与占位收进同一个同步块（`starting` 那段也算在路上），并发只会有一个 200 |
+| 3 | 客户端拿到 `probeAfterMs` 却从不使用，**外壳杀不掉那条安全失败是静默的** | `run()` 之后按 `probeAfterMs` 自查，没生效就弹窗并附上日志里「为什么没成」的那句 |
+| 4 | 助手不校验 `plan`：时间参数一旦是 `NaN`，「等进程消失」那条循环**没有终点** | 助手自己归一化/钳制五个时间参数（纯函数，可直接测），`waitGone` 也不再接受非有限期限 |
+
+顺手的三处：
+
+- `Origin: null`（sandbox iframe / `data:` / `file:` 页面）不再被当成「没有 Origin」放行；
+  桌面端不受影响 —— 外壳转发时本来就把 `origin` 头剥掉了。
+- `dsh.client.immediately: true`：与所有内置 Client 包一致，首屏就把这半个包预取下来
+  （不设置也能激活，只是多一个请求）。
+- 去掉 `peerDependencies.cordis`：DSH 的运行时包叫 `@deepseek-ai/cordis`，这个 peer 既不会
+  被兼容门评估（它只看 `@deepseek-ai/dsh*`），又可能在某天 `autoInstallPeers` 打开时从
+  registry 拉一个同名但无关的包。
+
+没改的：`window.alert` 那条失败提示留着（客户端确实没有 toast **服务**，`ui-commands`
+内部那条 composer 提示通道要额外耦合 `sessions` / `conversation` 两个服务，值不当）。
+另外**助手在「杀掉外壳之后、重新拉起之前」意外死掉，应用就没人拉起来了** —— 这是这套
+机制的残余风险，写在这里。
 
 ## 已知限制
 

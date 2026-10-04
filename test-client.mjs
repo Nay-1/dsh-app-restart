@@ -235,5 +235,99 @@ const bare = commandContributions.at(-1);
 check("绑不到 t 时菜单名还是中文", bare?.label?.() === "重启");
 check("绑不到 t 时说明还是中文", String(bare?.description?.() ?? "").includes("重新拉起"));
 
+/* ---- 重启之后的自查（probeAfterMs） --------------------------------------- *
+ * 回包成功只代表「助手已经上路」：助手的外壳杀不掉时会走安全失败，那条路没有回包可等，
+ * 「过了 probeAfterMs 这个界面居然还活着」就是它唯一的信号。这一节盯的是：
+ * 认出来、把原因摆出来、还在路上时别急着下结论、问不到时别乱弹窗。
+ * ------------------------------------------------------------------------ */
+console.log("\n[6] 探测：回包成功 ≠ 重启成功");
+
+// 第 4 节把 alert 换成了「一弹就抛」的替身（用来钉「弹不出提示也不能炸」），这里换回来。
+globalThis.window.alert = (message) => { alerts.push(String(message)); };
+
+const waitFor = async (predicate, timeoutMs, label) => {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    if (predicate()) return true;
+    if (Date.now() >= deadline) throw new Error(`等待超时：${label}`);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+};
+
+// 重新装一遍（这一份拿到的是能用的 locale 与 commandUi），后面都用它的 run()。
+mod.apply(makeCtx());
+const probed = commandContributions.at(-1);
+check("重新装上的贡献可以触发", typeof probed?.ui?.run === "function");
+
+/** 按 URL 分派的宿主应答：/restart 一律成功，/status 与 /log 交给每个用例。 */
+const respond = (statusReply, logReply) => {
+  const seen = { status: 0, log: 0 };
+  responder = async (url) => {
+    if (url.endsWith("/restart")) return { status: 200, json: async () => ({ ok: true, result: { probeAfterMs: 20 } }) };
+    if (url.endsWith("/status")) { seen.status += 1; return statusReply(); }
+    if (url.endsWith("/log")) { seen.log += 1; return logReply(); }
+    return { status: 404, json: async () => ({ ok: false, error: `unexpected ${url}` }) };
+  };
+  return seen;
+};
+const okStatus = (result) => () => ({ status: 200, json: async () => ({ ok: true, result }) });
+const okLog = (text) => () => ({ status: 200, json: async () => ({ ok: true, result: { logPath: "x", text } }) });
+
+// 6a. 外壳没杀掉（助手走了 ABORT）→ 必须报，而且要把「为什么」带出来。
+let alertsBefore = alerts.length;
+const seenA = respond(
+  okStatus({ restarting: false, helperAlive: false, previous: { outcome: "aborted" } }),
+  okLog('[t] app-restart requested\n[t] terminate: SIGTERM -> shell 1234\n[t] ABORT: shell 1234 is still alive; nothing was relaunched and the app keeps running\n[t] helper done: {"relaunched":false,"reason":"shell-alive"}\n')
+);
+probed.ui.run({});
+await waitFor(() => alerts.length > alertsBefore, 2000, "探测到没生效时弹窗");
+check("界面还活着 + 宿主说没在路上 → 报「这次重启没有生效」", alerts.at(-1)?.includes("没有生效"));
+check("把日志里「为什么没成」的那句（ABORT）带出来", alerts.at(-1)?.includes("ABORT: shell 1234 is still alive"));
+check("探测打的是真接口：/status 一次 + /log 一次", seenA.status === 1 && seenA.log === 1);
+check("失败提示仍然顶着「重启失败」的标题", alerts.at(-1)?.startsWith("重启失败"));
+
+// 6b. 助手还在路上（外壳还没死）→ 不能急着说失败，要按 probeAfterMs 再看。
+alertsBefore = alerts.length;
+let rounds = 0;
+respond(() => {
+  rounds += 1;
+  return { status: 200, json: async () => ({ ok: true, result: { restarting: rounds < 3 } }) };
+}, okLog("[t] ABORT: shell 9 is still alive\n"));
+probed.ui.run({});
+await waitFor(() => alerts.length > alertsBefore, 2000, "第三轮才判定");
+check("还在路上时继续等（问了 3 次 /status，不是一次就下结论）", rounds === 3);
+check("最终确实没生效 → 照样报出来", alerts.at(-1)?.includes("没有生效") && alerts.at(-1)?.includes("ABORT: shell 9"));
+
+// 6c. 探测期接口整个问不到（宿主已经换了一茬）→ 一声不吭。
+alertsBefore = alerts.length;
+responder = async (url) => {
+  if (url.endsWith("/restart")) return { status: 200, json: async () => ({ ok: true, result: { probeAfterMs: 20 } }) };
+  throw new Error("ECONNREFUSED");
+};
+probed.ui.run({});
+await new Promise((resolve) => setTimeout(resolve, 150));
+check("探测时接口问不到 → 不打扰用户，也不炸", alerts.length === alertsBefore);
+
+// 6d. 日志读不到（404 / 不是 JSON）→ 仍然要报「没生效」，只是没有尾巴。
+alertsBefore = alerts.length;
+respond(okStatus({ restarting: false }), () => ({ status: 404, json: async () => { throw new Error("not json"); } }));
+probed.ui.run({});
+await waitFor(() => alerts.length > alertsBefore, 2000, "没有日志也要报");
+check("日志读不到时只说「没生效」，不编造尾巴",
+  alerts.at(-1)?.includes("没有生效") && !alerts.at(-1)?.includes("宿主日志末尾"));
+
+// 6e. 宿主没给 probeAfterMs → 用兜底间隔，绝不立刻误报。
+alertsBefore = alerts.length;
+let fallbackCalls = 0;
+responder = async (url) => {
+  if (url.endsWith("/restart")) return { status: 200, json: async () => ({ ok: true, result: {} }) };
+  fallbackCalls += 1;
+  return { status: 200, json: async () => ({ ok: true, result: {} }) };
+};
+probed.ui.run({});
+await new Promise((resolve) => setTimeout(resolve, 150));
+check("宿主没给 probeAfterMs 时用兜底间隔（不会立刻误报，也不会去问接口）",
+  alerts.length === alertsBefore && fallbackCalls === 0);
+
 console.log(`\n${failed === 0 ? "全部通过" : "有失败项"}：${pass} 通过 / ${failed} 失败`);
 process.exitCode = failed === 0 ? 0 : 1;

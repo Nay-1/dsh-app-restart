@@ -1,6 +1,6 @@
 {
   "name": "dsh-app-restart",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "private": true,
   "description": "一条斜杠命令 /restart，把整个 DSH 桌面应用重启一遍（界面零足迹），让新装的插件与改动的配置真正生效。",
   "license": "MIT",
@@ -21,15 +21,13 @@
       "patch": "./cordis.patch.yml"
     },
     "client": {
+      "immediately": true,
       "inject": [
         "@deepseek-ai/dsh-client-locale",
         "@deepseek-ai/dsh-client-ui-commands"
       ],
       "platform": "web"
     }
-  },
-  "peerDependencies": {
-    "cordis": ">=4.0.0-rc <5"
   },
   "engines": {
     "node": "^22.15.0 || >=24.0.0"

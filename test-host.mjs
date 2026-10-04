@@ -14,9 +14,11 @@
  * 运行：node test-host.mjs
  */
 import { spawn } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { request as httpRequest } from "node:http";
+import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { Readable } from "node:stream";
 import { fileURLToPath } from "node:url";
 
@@ -93,6 +95,51 @@ check("宿主半没有注册 /restart（同名会和客户端贡献撞车）", c
 check("没有多余的告警", warnings.length === 0);
 
 /* ------------------------------------------------------------------------ *
+ * 1c. 助手的 plan 归一化
+ *
+ * 助手是「外壳已经杀掉之后」最后一道防线，plan 走的是 argv 里的一段 JSON：
+ * 时间预算一旦是 NaN，「等进程消失」那条循环就没有终点 —— 应用会永远等不到
+ * 重新拉起。这里把归一化当纯函数钉住（助手用 require.main 守卫，require 它不会跑）。
+ * ------------------------------------------------------------------------ */
+console.log("\n[1c] 助手：plan 归一化");
+
+const helperModule = createRequire(import.meta.url)(helperPath);
+check("助手导出 normalizePlan（纯函数，可直接测）", typeof helperModule?.normalizePlan === "function");
+const parsePlan = (plan) => helperModule.normalizePlan(JSON.stringify(plan));
+const LIMIT_KEYS = Object.keys(helperModule.TIMING_LIMITS ?? {});
+
+check("时间预算一共 5 项，且默认值都是有限正数", LIMIT_KEYS.length === 5
+  && Object.values(helperModule.TIMING_LIMITS).every((limits) => Number.isFinite(limits.fallback)
+    && limits.fallback >= limits.min && limits.fallback <= limits.max && limits.min > 0));
+
+const missing = parsePlan({});
+check("plan 缺时间参数 → 全部回落到默认值", LIMIT_KEYS.every((key) => missing[key] === helperModule.TIMING_LIMITS[key].fallback));
+
+// JSON 里 NaN/Infinity 会被写成 null；对象、字符串同理都是「非法值」，一律回落而不是抛错。
+const junk = parsePlan({ settleMs: null, shellTimeoutMs: "abc", forceTimeoutMs: {}, hostTimeoutMs: [], quietMs: Number.NaN });
+check("非法时间值（null/非数字字符串/对象/数组）一律回落到默认值",
+  LIMIT_KEYS.every((key) => junk[key] === helperModule.TIMING_LIMITS[key].fallback));
+check("归一化后每个时间参数都有限 —— 这正是 NaN 死循环的堵口", LIMIT_KEYS.every((key) => Number.isFinite(junk[key])));
+
+const clamped = parsePlan({ settleMs: 0, shellTimeoutMs: 999999999, forceTimeoutMs: -5, hostTimeoutMs: 1.6, quietMs: "2500" });
+check("越界值夹进区间、数字字符串照收",
+  clamped.settleMs === 300 && clamped.shellTimeoutMs === 120000 && clamped.forceTimeoutMs === 500
+  && clamped.hostTimeoutMs === 1000 && clamped.quietMs === 2500, JSON.stringify(clamped));
+
+const args = parsePlan({ relaunchArgs: ["--a", 7, null, "--b"] });
+check("relaunchArgs 一定收敛成字符串数组", Array.isArray(args.relaunchArgs)
+  && args.relaunchArgs.length === 2 && args.relaunchArgs.join(",") === "--a,--b");
+check("plan 不是对象时明确抛错（助手会 exit 2，而不是带病上路）",
+  ["5", "[]", "\"x\"", "null", "not json"].every((raw) => {
+    try {
+      helperModule.normalizePlan(raw);
+      return false;
+    } catch {
+      return true;
+    }
+  }));
+
+/* ------------------------------------------------------------------------ *
  * 2. API 行为
  * ------------------------------------------------------------------------ */
 console.log("\n[2] HTTP API");
@@ -135,6 +182,17 @@ const crossOrigin = await request("POST", "/app-restart/api/restart", {
   body: "{}"
 });
 check("Origin 与 Host 不一致 → 403", crossOrigin.status === 403);
+
+// 「没有 Origin」是桌面端外壳转发（它会把 origin 头剥掉）与本机脚本；
+// 「Origin: null」是 sandbox iframe / data: / file: 页面 —— 两者必须区别对待。
+const nullOrigin = await request("POST", "/app-restart/api/restart", {
+  headers: { ...HEADER, origin: "null", host: "127.0.0.1:19387" },
+  body: "{}"
+});
+check("Origin: null（sandbox/file 页面）当跨站拒绝 → 403", nullOrigin.status === 403, JSON.stringify(nullOrigin.json));
+
+const noOrigin = await request("POST", "/app-restart/api/restart", { headers: HEADER, body: "{}" });
+check("没有 Origin（外壳转发 / 本机脚本）照常放行到业务逻辑", noOrigin.status === 409, JSON.stringify(noOrigin.json));
 
 const sameOrigin = await request("POST", "/app-restart/api/restart", {
   headers: { ...HEADER, origin: "http://127.0.0.1:19387", host: "127.0.0.1:19387" },
@@ -446,6 +504,144 @@ setInterval(() => {}, 1000);
   check("外壳死后，助手仍然把应用拉起来了", existsSync(marker5));
   check("宿主跟着外壳一起没了（不留孤儿）", !alive(host5Pid));
   check("日志收尾成功", readFileSync(log5, "utf8").includes('"relaunched":true'));
+
+  /* --- 4. 状态机与并发：陈旧标记会自己清掉、并发只放行一次 ------------------ *
+   * 用一个「替身桌面宿主」跑真的宿主半：入口文件名就叫 dsh-desktop-host/lib/index.js
+   * （inspectDesktopHost 的判据之一），由带 IPC 通道的替身外壳拉起（判据之二），
+   * 于是 supported=true，可以直接对 HTTP 路由打真实的并发请求。
+   * 助手是真的：用 settleMs=15000 让它先睡着，测完再收掉。
+   * ------------------------------------------------------------------------ */
+  console.log("\n[4] 状态机（替身桌面宿主）");
+
+  const desktopRoot = join(workDir, "desktop-host");
+  const hostEntry = join(desktopRoot, "dsh-desktop-host", "lib", "index.js");
+  const portFile = join(desktopRoot, "port.txt");
+  mkdirSync(dirname(hostEntry), { recursive: true });
+  // 替身桌面宿主：装真的插件，把注册到的前缀路由挂到一个真 HTTP 服务上。
+  writeFileSync(hostEntry, `
+const http = require("node:http");
+const { writeFileSync } = require("node:fs");
+const { pathToFileURL } = require("node:url");
+const [pluginIndex, target] = process.argv.slice(2);
+(async () => {
+  const routes = [];
+  const ctx = {
+    logger: { info() {}, warn() {} },
+    effect: (install) => { install(); return () => {}; },
+    webServer: { register: (route) => { routes.push(route); return () => {}; } }
+  };
+  const { apply } = await import(pathToFileURL(pluginIndex).href);
+  apply(ctx);
+  const server = http.createServer((req, res) => {
+    Promise.resolve(routes[0].handler(req, res)).catch(() => { try { res.writeHead(500); res.end(); } catch {} });
+  });
+  server.listen(0, "127.0.0.1", () => { writeFileSync(target, String(server.address().port)); });
+})().catch((error) => { writeFileSync(target + ".error", String((error && error.stack) || error)); });
+`, "utf8");
+  const desktopShell = spawn(process.execPath, ["-e", `
+const { spawn } = require("node:child_process");
+spawn(process.execPath, [${JSON.stringify(hostEntry)}, ${JSON.stringify(join(packageDir, "lib", "index.js"))}, ${JSON.stringify(portFile)}], { stdio: ["ignore", "ignore", "pipe", "ipc"] });
+setInterval(() => {}, 1000);
+`], { stdio: "ignore" });
+  tracking.procs.push(desktopShell.pid);
+  await waitFor(() => existsSync(portFile) || existsSync(`${portFile}.error`), 8000, "替身桌面宿主上报端口");
+  const desktopPort = existsSync(portFile) ? Number(readFileSync(portFile, "utf8")) : 0;
+  check("替身桌面宿主就位（入口名 + IPC 通道 + ppid 都对得上）", desktopPort > 0 && alive(desktopShell.pid),
+    existsSync(`${portFile}.error`) ? readFileSync(`${portFile}.error`, "utf8") : `port=${desktopPort}`);
+
+  const api = (method, path, body) => new Promise((resolve, reject) => {
+    const payload = body === undefined ? undefined : Buffer.from(JSON.stringify(body), "utf8");
+    const req = httpRequest({
+      host: "127.0.0.1",
+      port: desktopPort,
+      method,
+      path: `/app-restart/api${path}`,
+      headers: {
+        "x-dsh-plugin-call": "app-restart",
+        ...(payload === undefined ? {} : { "content-type": "application/json", "content-length": payload.length })
+      }
+    }, (res) => {
+      const chunks = [];
+      res.on("data", (chunk) => chunks.push(chunk));
+      res.on("end", () => {
+        let json;
+        try {
+          json = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+        } catch {
+          json = undefined;
+        }
+        resolve({ status: res.statusCode, json });
+      });
+    });
+    req.once("error", reject);
+    req.end(payload);
+  });
+  const killPid = (pid) => { try { process.kill(pid, "SIGKILL"); } catch { /* 已经没了 */ } };
+  const waitGonePid = (pid, timeoutMs, label) => waitFor(() => !alive(pid), timeoutMs, label);
+
+  const statusFace = await api("GET", "/status");
+  check("status 认它是桌面端", statusFace.json?.result?.supported === true, JSON.stringify(statusFace.json));
+  check("status 报的外壳 pid 就是替身外壳", statusFace.json?.result?.shellPid === desktopShell.pid);
+  check("一开始没有重启在路上，也没有上一次的结局",
+    statusFace.json?.result?.restarting === false && statusFace.json?.result?.previous === null);
+
+  /* 4a. 并发：判忙与占位必须在同一个同步块里，否则两个请求会各自拉起一个助手。 */
+  const [firstReply, secondReply] = await Promise.all([
+    api("POST", "/restart", { settleMs: 15000 }),
+    api("POST", "/restart", { settleMs: 15000 })
+  ]);
+  const accepted = [firstReply, secondReply].filter((reply) => reply.status === 200);
+  const rejected = [firstReply, secondReply].filter((reply) => reply.status === 409);
+  check("两个并发 POST：恰好一个 200、一个 409", accepted.length === 1 && rejected.length === 1,
+    `${firstReply.status}/${secondReply.status}`);
+  check("busy 把原话摆出来", String(rejected[0]?.json?.error ?? "").includes("已经有一次重启在路上了"));
+  const helperPid = accepted[0]?.json?.result?.helperPid;
+  const helperLog = accepted[0]?.json?.result?.logPath;
+  check("回包里给了助手 pid、日志路径与探测时刻",
+    Number.isSafeInteger(helperPid) && typeof helperLog === "string"
+    && Number.isFinite(accepted[0]?.json?.result?.probeAfterMs), JSON.stringify(accepted[0]?.json?.result));
+  if (typeof helperLog === "string") tracking.dirs.push(dirname(helperLog));
+
+  const inFlight = await api("GET", "/status");
+  check("助手还活着时：restarting=true、helperAlive=true、上一轮 PID 照样回 busy",
+    inFlight.json?.result?.restarting === true && inFlight.json?.result?.helperAlive === true
+    && (await api("POST", "/restart", { settleMs: 15000 })).status === 409);
+
+  /* 4b. 助手没了而宿主还活着 = 上一次没成 → 陈旧标记必须自己清掉，允许重试。 */
+  killPid(helperPid);
+  await waitGonePid(helperPid, 5000, "助手消失");
+  const recovered = await api("GET", "/status");
+  check("助手没了 + 宿主还在 → restarting 自动回到 false", recovered.json?.result?.restarting === false);
+  check("顺带把上一次的结局记下来（被杀 → unknown）",
+    recovered.json?.result?.previous?.outcome === "unknown", JSON.stringify(recovered.json?.result?.previous));
+  const retry = await api("POST", "/restart", { settleMs: 15000 });
+  check("于是可以立刻重试（旧实现会永久 busy）", retry.status === 200, JSON.stringify(retry.json));
+  const retryPid = retry.json?.result?.helperPid;
+  const retryLog = retry.json?.result?.logPath;
+  if (typeof retryLog === "string") tracking.dirs.push(dirname(retryLog));
+
+  /* 4c. 收尾行优先于 PID：助手写了结局就算结束，哪怕进程号还没回收。 */
+  if (typeof retryLog === "string") {
+    appendFileSync(retryLog, [
+      `[${new Date().toISOString()}] ABORT: shell 1 is still alive; nothing was relaunched and the app keeps running`,
+      `[${new Date().toISOString()}] helper done: {"relaunched":false,"reason":"shell-alive"}`
+    ].join("\n") + "\n");
+    check("此刻助手进程确实还活着（所以这条判据只能靠日志）", alive(retryPid));
+  }
+  const abortedFace = await api("GET", "/status");
+  check("日志出现收尾行 → 判定结束，结局是 aborted",
+    abortedFace.json?.result?.restarting === false && abortedFace.json?.result?.previous?.outcome === "aborted",
+    JSON.stringify(abortedFace.json?.result?.previous));
+  const retryAgain = await api("POST", "/restart", { settleMs: 15000 });
+  check("aborted（外壳杀不掉那条安全失败）之后照样能重试", retryAgain.status === 200);
+  check("每次重启都换一个日志目录", typeof retryLog === "string" && retryAgain.json?.result?.logPath !== retryLog);
+  if (typeof retryAgain.json?.result?.logPath === "string") tracking.dirs.push(dirname(retryAgain.json.result.logPath));
+
+  killPid(retryPid);
+  killPid(retryAgain.json?.result?.helperPid);
+  killPid(desktopShell.pid);
+  await new Promise((resolve) => setTimeout(resolve, 200));
+  tracking.dirs.push(desktopRoot);
 } finally {
   for (const pid of tracking.procs.reverse()) {
     try {
