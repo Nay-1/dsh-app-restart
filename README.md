@@ -64,11 +64,20 @@ dsh plugin --profile desktop add "file:C:/Users/prince/Desktop/dsh-plugin/dsh-ap
 ```
 /restart（或直接 POST /app-restart/api/restart）→ 回包
      → host 半拉起分离式助手（同一个 exe + ELECTRON_RUN_AS_NODE=1，跑 lib/relaunch-helper.cjs）
-     → 助手静默 settleMs 让回包落地
-     → 终止外壳 PID
+     → 客户端拿到回包就 ack（POST /app-restart/api/delivered）
+     → 助手一收到 ack 立刻终止外壳 PID（没 ack 就等到 settleMs 这个上界）
      → 宿主随之消失（见下）
      → 助手确认两个进程都没了 → 静默一下 → 用干净环境重新拉起 DeepSeek Harness.exe
 ```
+
+**那 1.5 秒是上界，不是固定等待。** 助手必须在「回包已经落到页面上」之后才动手：外壳一死，
+页面到宿主的那条链路（`dsh-app://` → 外壳 `forwardWebRequest` → 宿主）跟着断，先杀后回包
+就会让客户端把一次成功的重启看成「重启接口没有响应」并弹错误框。所以宿主把「本次重启的
+ack 标记文件」写进助手的计划里，客户端一拿到回包就 `POST /delivered`，宿主写下标记，助手
+**立刻**动手 —— 实测（`test-host.mjs` 第 5 节）从 ack 到发 SIGTERM **92ms**；没有 ack
+（老客户端、curl 直调、标记写失败）就退回 `settleMs` 兜底，行为与没有 ack 之前一模一样。
+`settleMs` 因此从「每次都要等的固定开销」变成了保险丝，`DSH_APP_RESTART_SETTLE_MS`
+调的也是这根保险丝的长度。
 
 **宿主是怎么没的**（这一条实测过，两个平台不一样）：
 
@@ -174,9 +183,10 @@ iframe / `data:` / `file:` 页面发出来的浏览器请求，一律当跨站�
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| GET | `/status` | 能不能重启、外壳/宿主 pid、exe 路径、是否正在重启（`restarting` / `starting` / `helperAlive` / `previous`）、日志路径 |
+| GET | `/status` | 能不能重启、外壳/宿主 pid、exe 路径、是否正在重启（`restarting` / `starting` / `helperAlive` / `signalled` / `previous`）、日志路径 |
 | GET | `/log` | 最近一次重启的日志尾巴（最多 12 KB），没有则 404 |
 | POST | `/restart` | 触发重启。可选 body：`settleMs` / `shellTimeoutMs` / `forceTimeoutMs` / `hostTimeoutMs` / `quietMs` |
+| POST | `/delivered` | 客户端说「回包拿到了」：写 ack 标记，助手立刻动手。纯加速，没在重启时是安全空操作（`signalled:false`） |
 
 `GET /status` 与 `/restart` 都会顺手清掉「上一次其实早就结束了」的陈旧标记，所以它返回的
 `restarting` 永远是**现在**的真相：`previous` 是上一次的 `{ logPath, outcome }`，
@@ -218,8 +228,8 @@ Invoke-RestMethod -Headers @{ 'x-dsh-plugin-call' = 'app-restart' } `
 ## 自测
 
 ```powershell
-node test-host.mjs      # 77 项
-node test-client.mjs    # 51 项
+node test-host.mjs      # 90 项
+node test-client.mjs    # 57 项
 ```
 
 - `test-host.mjs`：注册契约、`plan` 归一化（纯函数，直接 `require` 助手拿它）、
@@ -233,17 +243,21 @@ node test-client.mjs    # 51 项
   对真的 HTTP 路由打真实请求，钉住状态机：**两个并发 POST 恰好一个 200、一个 409**；
   助手被杀掉之后陈旧标记自己清掉、可以立刻重试；日志里出现收尾行时即使助手进程还在，
   也按「已经结束」判定，结局是 `aborted`。
+  再往后是 **ack 握手**那一节：`settleMs` 给 15000 的上界，ack 一到助手就必须在几百毫秒内
+  发 SIGTERM（日志里那句 `ack received after Nms` 就是判据），并且真的把替身外壳杀掉。
 - `test-client.mjs`：mock Module Loader / React / fetch / window，把客户端半真的装起来，
   盯注册契约、菜单行的图标与中英文案、`run()` 打出去的请求（方法/头/body）、
   失败弹窗（非桌面端 / busy / host 半缺席 / 连弹窗都抛），以及降级路径
   （没有 `commandUi`、`scope.get` 抛错、没有 `ctx.inject`、绑不到 `t`）。最后一段专测
-  **重启之后的自查**：外壳没杀掉要报出来并带上日志里「为什么没成」的那句、助手还在路上时
+  **重启之后的两件事**：ack 要在 restart 之后打、带调用头、不带 body，失败要一声不吭；
+  以及自查：外壳没杀掉要报出来并带上日志里「为什么没成」的那句、助手还在路上时
   要按 `probeAfterMs` 继续等而不是急着下结论、探测期接口问不到时一声不吭、
   宿主没给 `probeAfterMs` 时用兜底间隔。里面的 `require` 是严格的：除了基座里的 `react`
   之外任何 require 都会让测试当场红。
 
-两个测试都**不会**碰正在运行的 DSH：替身进程都是自己拉起来自己收掉的；
-助手是用 `settleMs=15000` 拉起来的（测完就被收掉，绝不会真的去杀外壳）。
+两个测试都**不会**碰正在运行的 DSH：替身进程都是自己拉起来自己收掉的；助手平时用
+`settleMs=15000` 拉起（测完就被收掉），只有 ack 那一节会真的动手 —— 而它杀的是测试
+自己拉起来的替身外壳，不是任何真实进程。
 
 ## 1.3.0 修了什么
 
@@ -270,6 +284,22 @@ node test-client.mjs    # 51 项
 内部那条 composer 提示通道要额外耦合 `sessions` / `conversation` 两个服务，值不当）。
 另外**助手在「杀掉外壳之后、重新拉起之前」意外死掉，应用就没人拉起来了** —— 这是这套
 机制的残余风险，写在这里。
+
+## 1.3.1 修了什么：ack 握手（1.5 秒 → 约 0.1 秒）
+
+1.3.0 之前（含 1.3.0），`/restart` 每次都要等 `settleMs`（默认 1500ms）才关外壳 —— 那是
+「回包先落地」的保险，但它被当成了固定等待。现在客户端拿到回包就 ack，助手立刻动手：
+
+| | 请求 → 外壳被杀 | 请求 → 重新拉起 |
+|---|---|---|
+| 旧（v1.0.0 ~ v1.3.0） | 1542 ~ 1558 ms（每次都是） | 2290 ~ 2305 ms |
+| 新（v1.3.1，有 ack） | 约 **100 ~ 200 ms**（助手 ack 后实测 92ms 就发 SIGTERM） | 约 0.8 ~ 1.0 s |
+| 新（无 ack：老客户端 / curl） | 仍是 `settleMs` 上界，行为不变 | 同上 |
+
+安全性没变：ack 缺席时走的就是原来那条路。新增的东西只有三处 —— 宿主多一个
+`POST /delivered`（写本次重启自己的 ack 标记，仍要自定义头）、助手第 1 步从「睡 settleMs」
+改成「等标记，最多 settleMs」、客户端在回包之后补一个 ack（失败一律吞掉：那时外壳多半
+已经死了，请求本来就回不来）。
 
 ## 已知限制
 

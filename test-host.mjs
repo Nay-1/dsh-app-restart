@@ -194,6 +194,12 @@ check("Origin: null（sandbox/file 页面）当跨站拒绝 → 403", nullOrigin
 const noOrigin = await request("POST", "/app-restart/api/restart", { headers: HEADER, body: "{}" });
 check("没有 Origin（外壳转发 / 本机脚本）照常放行到业务逻辑", noOrigin.status === 409, JSON.stringify(noOrigin.json));
 
+const ackNoHeader = await request("POST", "/app-restart/api/delivered", { body: "" });
+check("ack 也是写接口：缺自定义头 → 403（跨站页面推不动它）", ackNoHeader.status === 403, JSON.stringify(ackNoHeader.json));
+const ackIdle = await request("POST", "/app-restart/api/delivered", { headers: HEADER, body: "" });
+check("没在重启时 ack 是安全的空操作（signalled=false）",
+  ackIdle.status === 200 && ackIdle.json?.result?.signalled === false, JSON.stringify(ackIdle.json));
+
 const sameOrigin = await request("POST", "/app-restart/api/restart", {
   headers: { ...HEADER, origin: "http://127.0.0.1:19387", host: "127.0.0.1:19387" },
   body: "{}"
@@ -513,12 +519,11 @@ setInterval(() => {}, 1000);
    * ------------------------------------------------------------------------ */
   console.log("\n[4] 状态机（替身桌面宿主）");
 
-  const desktopRoot = join(workDir, "desktop-host");
-  const hostEntry = join(desktopRoot, "dsh-desktop-host", "lib", "index.js");
-  const portFile = join(desktopRoot, "port.txt");
-  mkdirSync(dirname(hostEntry), { recursive: true });
-  // 替身桌面宿主：装真的插件，把注册到的前缀路由挂到一个真 HTTP 服务上。
-  writeFileSync(hostEntry, `
+  const killPid = (pid) => { try { process.kill(pid, "SIGKILL"); } catch { /* 已经没了 */ } };
+  const waitGonePid = (pid, timeoutMs, label) => waitFor(() => !alive(pid), timeoutMs, label);
+
+  /** 替身桌面宿主的脚本：装真的插件，把注册到的前缀路由挂到一个真 HTTP 服务上。 */
+  const FAKE_HOST_SOURCE = `
 const http = require("node:http");
 const { writeFileSync } = require("node:fs");
 const { pathToFileURL } = require("node:url");
@@ -537,51 +542,71 @@ const [pluginIndex, target] = process.argv.slice(2);
   });
   server.listen(0, "127.0.0.1", () => { writeFileSync(target, String(server.address().port)); });
 })().catch((error) => { writeFileSync(target + ".error", String((error && error.stack) || error)); });
-`, "utf8");
-  const desktopShell = spawn(process.execPath, ["-e", `
+`;
+
+  /**
+   * 拉一个替身桌面宿主（入口名 + IPC 通道两个结构性判据都对得上），返回打接口的工具。
+   * @param label - 用来区分工作目录，同一个测试里可以拉好几个。
+   */
+  const startFakeDesktop = async (label) => {
+    const root = join(workDir, `desktop-host-${label}`);
+    const entry = join(root, "dsh-desktop-host", "lib", "index.js");
+    const portFile = join(root, "port.txt");
+    mkdirSync(dirname(entry), { recursive: true });
+    writeFileSync(entry, FAKE_HOST_SOURCE, "utf8");
+    const shell = spawn(process.execPath, ["-e", `
 const { spawn } = require("node:child_process");
-spawn(process.execPath, [${JSON.stringify(hostEntry)}, ${JSON.stringify(join(packageDir, "lib", "index.js"))}, ${JSON.stringify(portFile)}], { stdio: ["ignore", "ignore", "pipe", "ipc"] });
+spawn(process.execPath, [${JSON.stringify(entry)}, ${JSON.stringify(join(packageDir, "lib", "index.js"))}, ${JSON.stringify(portFile)}], { stdio: ["ignore", "ignore", "pipe", "ipc"] });
 setInterval(() => {}, 1000);
 `], { stdio: "ignore" });
-  tracking.procs.push(desktopShell.pid);
-  await waitFor(() => existsSync(portFile) || existsSync(`${portFile}.error`), 8000, "替身桌面宿主上报端口");
-  const desktopPort = existsSync(portFile) ? Number(readFileSync(portFile, "utf8")) : 0;
-  check("替身桌面宿主就位（入口名 + IPC 通道 + ppid 都对得上）", desktopPort > 0 && alive(desktopShell.pid),
-    existsSync(`${portFile}.error`) ? readFileSync(`${portFile}.error`, "utf8") : `port=${desktopPort}`);
-
-  const api = (method, path, body) => new Promise((resolve, reject) => {
-    const payload = body === undefined ? undefined : Buffer.from(JSON.stringify(body), "utf8");
-    const req = httpRequest({
-      host: "127.0.0.1",
-      port: desktopPort,
-      method,
-      path: `/app-restart/api${path}`,
-      headers: {
-        "x-dsh-plugin-call": "app-restart",
-        ...(payload === undefined ? {} : { "content-type": "application/json", "content-length": payload.length })
-      }
-    }, (res) => {
-      const chunks = [];
-      res.on("data", (chunk) => chunks.push(chunk));
-      res.on("end", () => {
-        let json;
-        try {
-          json = JSON.parse(Buffer.concat(chunks).toString("utf8"));
-        } catch {
-          json = undefined;
+    tracking.procs.push(shell.pid);
+    tracking.dirs.push(root);
+    await waitFor(() => existsSync(portFile) || existsSync(`${portFile}.error`), 8000, `替身桌面宿主 ${label} 上报端口`);
+    const port = existsSync(portFile) ? Number(readFileSync(portFile, "utf8")) : 0;
+    const api = (method, path, body) => new Promise((resolve, reject) => {
+      const payload = body === undefined ? undefined : Buffer.from(JSON.stringify(body), "utf8");
+      const req = httpRequest({
+        host: "127.0.0.1",
+        port,
+        method,
+        path: `/app-restart/api${path}`,
+        headers: {
+          "x-dsh-plugin-call": "app-restart",
+          ...(payload === undefined ? {} : { "content-type": "application/json", "content-length": payload.length })
         }
-        resolve({ status: res.statusCode, json });
+      }, (res) => {
+        const chunks = [];
+        res.on("data", (chunk) => chunks.push(chunk));
+        res.on("end", () => {
+          let json;
+          try {
+            json = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+          } catch {
+            json = undefined;
+          }
+          resolve({ status: res.statusCode, json });
+        });
       });
+      req.once("error", reject);
+      req.end(payload);
     });
-    req.once("error", reject);
-    req.end(payload);
-  });
-  const killPid = (pid) => { try { process.kill(pid, "SIGKILL"); } catch { /* 已经没了 */ } };
-  const waitGonePid = (pid, timeoutMs, label) => waitFor(() => !alive(pid), timeoutMs, label);
+    return {
+      root,
+      port,
+      shell,
+      api,
+      ok: port > 0 && alive(shell.pid),
+      error: existsSync(`${portFile}.error`) ? readFileSync(`${portFile}.error`, "utf8") : `port=${port}`
+    };
+  };
+
+  const desktop = await startFakeDesktop("state");
+  const api = desktop.api;
+  check("替身桌面宿主就位（入口名 + IPC 通道 + ppid 都对得上）", desktop.ok, desktop.error);
 
   const statusFace = await api("GET", "/status");
   check("status 认它是桌面端", statusFace.json?.result?.supported === true, JSON.stringify(statusFace.json));
-  check("status 报的外壳 pid 就是替身外壳", statusFace.json?.result?.shellPid === desktopShell.pid);
+  check("status 报的外壳 pid 就是替身外壳", statusFace.json?.result?.shellPid === desktop.shell.pid);
   check("一开始没有重启在路上，也没有上一次的结局",
     statusFace.json?.result?.restarting === false && statusFace.json?.result?.previous === null);
 
@@ -639,9 +664,51 @@ setInterval(() => {}, 1000);
 
   killPid(retryPid);
   killPid(retryAgain.json?.result?.helperPid);
-  killPid(desktopShell.pid);
+  killPid(desktop.shell.pid);
   await new Promise((resolve) => setTimeout(resolve, 200));
-  tracking.dirs.push(desktopRoot);
+
+  /* --- 5. ack 握手：回包确认一到，助手立刻动手（不等 settleMs 上界）--------- *
+   * 这一次要真的让助手把外壳杀掉，所以单独拉一个替身桌面宿主，放在最后跑。
+   * 判据是日志里的时间戳与那句 `ack received after Nms`：settleMs 给 15000，
+   * 助手却必须在几百毫秒内就发 SIGTERM —— 否则就是没走 ack 那条路。
+   * ------------------------------------------------------------------------ */
+  console.log("\n[5] ack 握手（回包确认一到就动手）");
+
+  const ackDesktop = await startFakeDesktop("ack");
+  check("第二个替身桌面宿主就位", ackDesktop.ok, ackDesktop.error);
+
+  const ackStatus = await ackDesktop.api("GET", "/status");
+  check("还没重启时 signalled=false（没有东西可确认）", ackStatus.json?.result?.signalled === false);
+  const strayAck = await ackDesktop.api("POST", "/delivered");
+  check("没在重启时的 ack 也安全：200 + signalled=false",
+    strayAck.status === 200 && strayAck.json?.result?.signalled === false, JSON.stringify(strayAck.json));
+
+  const ackRestart = await ackDesktop.api("POST", "/restart", { settleMs: 15000 });
+  check("重启照常触发（settleMs 给了 15000 的上界）", ackRestart.status === 200, JSON.stringify(ackRestart.json));
+  const ackLog = typeof ackRestart.json?.result?.logPath === "string" ? ackRestart.json.result.logPath : "";
+  const ackHelper = ackRestart.json?.result?.helperPid;
+  if (ackLog !== "") tracking.dirs.push(dirname(ackLog));
+  const armed = await ackDesktop.api("GET", "/status");
+  check("重启在路上时 signalled 还是 false（客户端还没 ack）", armed.json?.result?.signalled === false);
+
+  const ackStarted = Date.now();
+  const ackReply = await ackDesktop.api("POST", "/delivered");
+  check("客户端 ack → 200 + signalled=true",
+    ackReply.status === 200 && ackReply.json?.result?.signalled === true, JSON.stringify(ackReply.json));
+
+  const ackTextOf = () => (ackLog !== "" && existsSync(ackLog) ? readFileSync(ackLog, "utf8") : "");
+  await waitFor(() => ackTextOf().includes("terminate: SIGTERM -> shell"), 5000, "助手收到 ack 后动手");
+  const ackElapsed = Date.now() - ackStarted;
+  const ackText = ackTextOf();
+  check(`ack 之后助手几乎立刻动手（实测 ${ackElapsed}ms，上界是 15000ms）`, ackElapsed < 3000, `${ackElapsed}ms`);
+  check("日志里记着是 ack 让它提前动手的", /ack received after \d+ms; proceeding/.test(ackText));
+  check("没有走 settleMs 兜底那条路", !ackText.includes("no ack within"));
+
+  // 外壳已经死了（替身宿主随之消失），剩下的只有收尾：助手会按 quietMs 拉起 node.exe（无参、立刻退出）。
+  await waitGonePid(ackDesktop.shell.pid, 5000, "替身外壳被 ack 路径杀掉");
+  check("替身外壳确实被杀了（ack 路径走通）", !alive(ackDesktop.shell.pid));
+  await waitGonePid(ackHelper, 20000, "助手自己收尾");
+  check("助手也跑完收尾（不留孤儿）", !alive(ackHelper));
 } finally {
   for (const pid of tracking.procs.reverse()) {
     try {

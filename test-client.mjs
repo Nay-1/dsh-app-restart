@@ -152,7 +152,9 @@ const settle = () => new Promise((resolve) => setTimeout(resolve, 20));
 
 command.ui.run({});
 await settle();
-let restartCall = fetchCalls.at(-1);
+// 只看 /restart 那一条：run() 成功之后还会补一个 /delivered 的 ack（见第 6 节）。
+const lastRestartCall = () => fetchCalls.filter((call) => call.url === "/app-restart/api/restart").at(-1);
+let restartCall = lastRestartCall();
 check("run() 打出 POST /app-restart/api/restart",
   restartCall?.url === "/app-restart/api/restart" && restartCall?.init.method === "POST");
 check("带上 JSON content-type", restartCall?.init.headers["content-type"] === "application/json");
@@ -320,6 +322,7 @@ check("日志读不到时只说「没生效」，不编造尾巴",
 alertsBefore = alerts.length;
 let fallbackCalls = 0;
 responder = async (url) => {
+  if (url.endsWith("/delivered")) return { status: 200, json: async () => ({ ok: true, result: { signalled: true } }) };
   if (url.endsWith("/restart")) return { status: 200, json: async () => ({ ok: true, result: {} }) };
   fallbackCalls += 1;
   return { status: 200, json: async () => ({ ok: true, result: {} }) };
@@ -328,6 +331,37 @@ probed.ui.run({});
 await new Promise((resolve) => setTimeout(resolve, 150));
 check("宿主没给 probeAfterMs 时用兜底间隔（不会立刻误报，也不会去问接口）",
   alerts.length === alertsBefore && fallbackCalls === 0);
+
+// 6f. ack 握手：回包一到就先告诉宿主「我拿到了」，助手才不必干等 settleMs。
+alertsBefore = alerts.length;
+const callsBefore = fetchCalls.length;
+responder = async (url) => {
+  if (url.endsWith("/delivered")) return { status: 200, json: async () => ({ ok: true, result: { signalled: true } }) };
+  if (url.endsWith("/restart")) return { status: 200, json: async () => ({ ok: true, result: { probeAfterMs: 60000 } }) };
+  throw new Error("ECONNREFUSED");
+};
+probed.ui.run({});
+await waitFor(() => fetchCalls.slice(callsBefore).some((entry) => entry.url === "/app-restart/api/delivered"), 2000, "ack 打出去");
+const thisRun = fetchCalls.slice(callsBefore).map((entry) => entry.url);
+const ackIndex = thisRun.indexOf("/app-restart/api/delivered");
+const restartIndex = thisRun.lastIndexOf("/app-restart/api/restart");
+const ackCall = fetchCalls.slice(callsBefore)[ackIndex];
+check("回包一到就 ack：POST /app-restart/api/delivered", ackCall?.init?.method === "POST");
+check("ack 带调用头（写接口的门槛）", ackCall?.init?.headers["x-dsh-plugin-call"] === "app-restart");
+check("ack 不带 body、不带 content-type", ackCall?.init?.body === undefined
+  && ackCall?.init?.headers["content-type"] === undefined);
+check("ack 在 restart 之后打（顺序不能反）", restartIndex >= 0 && ackIndex > restartIndex, thisRun.join(" → "));
+check("ack 成功不打扰用户", alerts.length === alertsBefore);
+
+// 6g. ack 打不出去（外壳已经死了，请求连响应都回不来）→ 一声不吭。
+alertsBefore = alerts.length;
+responder = async (url) => {
+  if (url.endsWith("/restart")) return { status: 200, json: async () => ({ ok: true, result: { probeAfterMs: 60000 } }) };
+  throw new Error("ECONNREFUSED");
+};
+probed.ui.run({});
+await new Promise((resolve) => setTimeout(resolve, 150));
+check("ack 失败也一声不吭（助手会按 settleMs 兜底）", alerts.length === alertsBefore);
 
 console.log(`\n${failed === 0 ? "全部通过" : "有失败项"}：${pass} 通过 / ${failed} 失败`);
 process.exitCode = failed === 0 ? 0 : 1;
